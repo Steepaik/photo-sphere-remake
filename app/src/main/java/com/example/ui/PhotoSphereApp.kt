@@ -41,6 +41,8 @@ import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -95,7 +97,7 @@ fun PhotoSphereApp() {
     val lifecycleOwner = LocalLifecycleOwner.current
 
     // Navigation and screen state
-    var currentScreen by remember { mutableStateFlowState(AppScreen.DASHBOARD) }
+    var currentScreen by remember { mutableStateFlowState(AppScreen.CAPTURE) }
 
     // Configuration / Specifications
     var selectedLens by remember { mutableStateFlowState("Wide (1x)") }
@@ -110,6 +112,9 @@ fun PhotoSphereApp() {
     var seamBlendingRadius by remember { mutableStateFlowState(64f) }                // [16f, 128f]
     var vibrationPower by remember { mutableStateFlowState("Subtle Pulse") }          // None, Subtle Pulse, Tactile snap
     var captureSoundEffect by remember { mutableStateFlowState("Standard Shutter") }  // Muted, Standard Shutter, Electronic Beep
+    var autoCaptureDelayMs by remember { mutableStateFlowState(500) }                 // 200, 500, 1000, 2000 ms
+    var slamGridDensity by remember { mutableStateFlowState("Normal") }               // Low, Normal, High, Max
+    var alignmentTolerance by remember { mutableStateFlowState(1.8f) }                // 1.0f, 1.8f, 3.0f degrees
 
     // Active capture tracking
     var nodesList by remember { mutableStateFlowState(generateNodesForLens("Wide (1x)")) }
@@ -273,6 +278,7 @@ fun PhotoSphereApp() {
                 AppScreen.CAPTURE -> {
                     CaptureScreen(
                         selectedLens = selectedLens,
+                        onLensChange = { selectedLens = it },
                         rawOutputEnabled = rawOutputEnabled,
                         autoCaptureEnabled = autoCaptureEnabled,
                         onAutoCaptureToggle = { autoCaptureEnabled = it },
@@ -286,6 +292,12 @@ fun PhotoSphereApp() {
                         onVibrationPowerChange = { vibrationPower = it },
                         captureSoundEffect = captureSoundEffect,
                         onCaptureSoundEffectChange = { captureSoundEffect = it },
+                        autoCaptureDelayMs = autoCaptureDelayMs,
+                        onAutoCaptureDelayMsChange = { autoCaptureDelayMs = it },
+                        slamGridDensity = slamGridDensity,
+                        onSlamGridDensityChange = { slamGridDensity = it },
+                        alignmentTolerance = alignmentTolerance,
+                        onAlignmentToleranceChange = { alignmentTolerance = it },
                         nodes = nodesList,
                         currentYaw = currentYaw,
                         currentPitch = currentPitch,
@@ -481,7 +493,7 @@ fun generateNodesForLens(lens: String): List<PhotoSphereNode> {
     when (lens) {
         "Ultrawide (0.5x)" -> {
             for (i in 0 until 6) {
-                val yaw = -150f + (360f / 6f) * i
+                val yaw = -180f + 60f * i
                 list.add(PhotoSphereNode("UW-H$i", yaw, 0f, elevationBand = PhotoSphereNode.ElevationBand.HORIZON))
             }
             list.add(PhotoSphereNode("UW-Z", 0f, 80f, elevationBand = PhotoSphereNode.ElevationBand.ZENITH))
@@ -839,10 +851,47 @@ fun DashboardScreen(
         }
     }
 }
-        // ------------------ 2. CAMERA CAPTURE VIEWFINDER ------------------
+
+      // ------------------ 3D PERSPECTIVE PROJECTION SYSTEM ------------------
+fun project3DPoint(
+    worldX: Float,
+    worldY: Float,
+    worldZ: Float,
+    cyRad: Float,
+    cpRad: Float,
+    crRad: Float,
+    width: Float,
+    height: Float,
+    focalScale: Float
+): Offset? {
+    // 1. Rotate around vertical Y center (yaw angle)
+    val x1 = worldX * cos(cyRad) + worldZ * sin(cyRad)
+    val y1 = worldY
+    val z1 = -worldX * sin(cyRad) + worldZ * cos(cyRad)
+
+    // 2. Rotate around horizontal X center (pitch angle)
+    val x2 = x1
+    val y2 = y1 * cos(cpRad) + z1 * sin(cpRad)
+    val z2 = -y1 * sin(cpRad) + z1 * cos(cpRad)
+
+    // 3. Rotate around Z axis (roll angle) - stabilizing screen coordinates against device roll
+    val x3 = x2 * cos(crRad) + y2 * sin(crRad)
+    val y3 = -x2 * sin(crRad) + y2 * cos(crRad)
+    val z3 = z2
+
+    if (z3 > 0.05f) {
+        val px = (width / 2f) + (x3 * focalScale) / z3
+        val py = (height / 2f) - (y3 * focalScale) / z3
+        return Offset(px, py)
+    }
+    return null
+}
+
+// ------------------ 2. CAMERA CAPTURE VIEWFINDER ------------------
 @Composable
 fun CaptureScreen(
     selectedLens: String,
+    onLensChange: (String) -> Unit,
     rawOutputEnabled: Boolean,
     autoCaptureEnabled: Boolean,
     onAutoCaptureToggle: (Boolean) -> Unit,
@@ -856,6 +905,12 @@ fun CaptureScreen(
     onVibrationPowerChange: (String) -> Unit,
     captureSoundEffect: String,
     onCaptureSoundEffectChange: (String) -> Unit,
+    autoCaptureDelayMs: Int,
+    onAutoCaptureDelayMsChange: (Int) -> Unit,
+    slamGridDensity: String,
+    onSlamGridDensityChange: (String) -> Unit,
+    alignmentTolerance: Float,
+    onAlignmentToleranceChange: (Float) -> Unit,
     nodes: List<PhotoSphereNode>,
     currentYaw: Float,
     currentPitch: Float,
@@ -873,59 +928,96 @@ fun CaptureScreen(
     onUndoLastCapture: () -> Unit
 ) {
     val context = LocalContext.current
+    val density = LocalDensity.current.density
     val totalCaptured = nodes.filter { it.captured }.size
     val totalProgress = totalCaptured.toFloat() / nodes.size
     var isSettingsOverlayOpen by remember { mutableStateOf(false) }
 
+    // First frame logic: Show only start target if nothing is captured yet
+    val activeNodes = if (totalCaptured == 0) {
+        nodes.filter { it.targetYaw == 0f && it.targetPitch == 0f }
+    } else {
+        nodes
+    }
+
+    // Determine if we are locked onto any active uncaptured node
+    val nextTargetNode = activeNodes.firstOrNull { node ->
+        if (node.captured) return@firstOrNull false
+        var diffYaw = node.targetYaw - currentYaw
+        while (diffYaw > 180f) diffYaw -= 360f
+        while (diffYaw < -180f) diffYaw += 360f
+        val diffPitch = node.targetPitch - currentPitch
+        abs(diffYaw) < alignmentTolerance && abs(diffPitch) < alignmentTolerance
+    }
+
+    // Alignment countdown progress [0f, 1f]
+    var alignmentProgress by remember { mutableStateOf(0f) }
+
+    LaunchedEffect(nextTargetNode, activeNodeIdInBurst) {
+        if (nextTargetNode != null && activeNodeIdInBurst == null) {
+            alignmentProgress = 0f
+            val totalDuration = autoCaptureDelayMs.toFloat()
+            val stepDuration = 16L
+            var elapsed = 0f
+            while (elapsed < totalDuration) {
+                kotlinx.coroutines.delay(stepDuration)
+                elapsed += stepDuration
+                alignmentProgress = (elapsed / totalDuration).coerceIn(0f, 1f)
+            }
+            if (autoCaptureEnabled) {
+                onTriggerBurstCapture(nextTargetNode)
+            }
+            alignmentProgress = 0f
+        } else {
+            alignmentProgress = 0f
+        }
+    }
+
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color(0xFF090A0E))
+            .background(Color(0xFF000000)) // Pure pitch black canvas
     ) {
+        val cyRad = Math.toRadians(currentYaw.toDouble()).toFloat()
+        val cpRad = Math.toRadians(currentPitch.toDouble()).toFloat()
+        val crRad = Math.toRadians(currentRoll.toDouble()).toFloat()
+
         // --- 1. PERSPECTIVE 3D GROUND PLANE OF CROSSES ---
-        // Renders the spatial SLAM coordinate floor matrix stretching in 3D perspective
         Canvas(
             modifier = Modifier.fillMaxSize()
         ) {
             val width = size.width
             val height = size.height
+            val focalScale = width * 1.5f
 
-            val yawRad = Math.toRadians(currentYaw.toDouble()).toFloat()
-            val pitchRad = Math.toRadians(currentPitch.toDouble()).toFloat()
-            val cosYaw = cos(yawRad)
-            val sinYaw = sin(yawRad)
-            val cosPitch = cos(pitchRad)
-            val sinPitch = sin(pitchRad)
+            val stepSize = when (slamGridDensity) {
+                "Low" -> 1.2f
+                "High" -> 0.6f
+                "Max" -> 0.4f
+                else -> 0.8f
+            }
+            val bound = when (slamGridDensity) {
+                "Low" -> 6
+                "High" -> 15
+                "Max" -> 20
+                else -> 10
+            }
 
-            // Ground origin point configuration: 1.3 meters below camera
-            val groundY = -1.3f
-            val focalScale = width * 1.15f
+            for (gx in -bound..bound) {
+                for (gz in -bound..bound) {
+                    val worldX = gx * stepSize
+                    val worldZ = gz * stepSize
+                    val worldY = -1.2f // 1.2 meters below camera
 
-            // Iterate on a grid floor around coordinate space
-            for (gx in -8..8) {
-                for (gz in 1..12) {
-                    val worldX = gx * 0.9f
-                    val worldZ = gz * 0.9f
-
-                    // Rotate around vertical Y center (yaw angle)
-                    val x1 = worldX * cosYaw - worldZ * sinYaw
-                    val z1 = worldX * sinYaw + worldZ * cosYaw
-                    val y1 = groundY
-
-                    // Rotate around horizontal X center (pitch angle)
-                    val x2 = x1
-                    val y2 = y1 * cosPitch - z1 * sinPitch
-                    val z2 = y1 * sinPitch + z1 * cosPitch
-
-                    // Perspective projection division
-                    if (z2 > 0.15f) {
-                        val px = (width / 2f) + (x2 * focalScale) / z2
-                        val py = (height / 2f) - (y2 * focalScale) / z2
-
+                    val pt = project3DPoint(worldX, worldY, worldZ, cyRad, cpRad, crRad, width, height, focalScale)
+                    if (pt != null) {
+                        val px = pt.x
+                        val py = pt.y
                         if (px in 0f..width && py in 0f..height) {
-                            val depthAlpha = (1.0f - (z2 / 10f)).coerceIn(0.04f, 0.45f)
+                            val distance = sqrt(worldX * worldX + worldY * worldY + worldZ * worldZ)
+                            val depthAlpha = (1.0f - (distance / 7.0f)).coerceIn(0.04f, 0.45f)
                             val crossHalfSize = 4.dp.toPx()
-                            
+
                             drawLine(
                                 color = Color.White.copy(alpha = depthAlpha),
                                 start = Offset(px - crossHalfSize, py),
@@ -945,39 +1037,42 @@ fun CaptureScreen(
         }
 
         // --- 2. ACTIVE CAMERA VIEWFINDER PORTRAIT CARD ---
-        // High fidelity centered screen mask representing the physical active lens viewport
         Box(
             modifier = Modifier
                 .size(width = 240.dp, height = 360.dp)
                 .align(Alignment.Center)
+                .graphicsLayer {
+                    // Apply immersive 3D perspective tilt relative to camera elevation and gravity roll
+                    rotationX = -currentPitch * 0.25f
+                    rotationY = currentYaw * 0.12f
+                    rotationZ = -currentRoll * 0.5f
+                    cameraDistance = 10f * density
+                }
                 .clip(RoundedCornerShape(12.dp))
-                .border(2.dp, Color.White, RoundedCornerShape(11.dp))
+                .border(2.dp, Color.White.copy(alpha = 0.9f), RoundedCornerShape(11.dp))
                 .testTag("centered_camera_viewport")
         ) {
             if (!isManualSwipeMode && ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
                 CameraXPreviewView(modifier = Modifier.fillMaxSize())
             } else {
-                // High contrast simulated viewfinder layout
                 Box(
                     modifier = Modifier
                         .fillMaxSize()
-                        .background(Color(0xFF11131A))
+                        .background(Color(0xFF0F1015))
                 ) {
                     Canvas(modifier = Modifier.fillMaxSize()) {
                         val w = size.width
                         val h = size.height
 
-                        // Gentle gradient simulated skyline which shifts with yaw/pitch angles
                         val panX = (currentYaw * 4f) % w
                         val panY = (currentPitch * 4f) % h
 
                         drawRect(
                             brush = Brush.verticalGradient(
-                                colors = listOf(Color(0xFF1E2638), Color(0xFF0F121C))
+                                colors = listOf(Color(0xFF1E2638), Color(0xFF08090E))
                             )
                         )
 
-                        // Visual simulated background horizon landscape
                         val landscapePath = androidx.compose.ui.graphics.Path().apply {
                             moveTo(0f, h)
                             lineTo(w * 0.25f, h * 0.45f + panY)
@@ -988,14 +1083,44 @@ fun CaptureScreen(
                         }
                         drawPath(
                             path = landscapePath,
-                            color = Color(0xFF333E54).copy(alpha = 0.4f)
+                            color = Color(0xFF333E54).copy(alpha = 0.35f)
                         )
                     }
                 }
             }
         }
 
-        // --- 3. FULL-SCREEN INTERACTIVE CANVAS (FLOATING PHOTO FRAMES AND TARGETS) ---
+        // --- OVERLAPPING LENS SWITCHER PILL (Pixel style) ---
+        Row(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(top = 405.dp) // Offset directly below the viewport card height
+                .background(Color.Black.copy(alpha = 0.82f), RoundedCornerShape(20.dp))
+                .border(1.dp, Color.White.copy(alpha = 0.15f), RoundedCornerShape(20.dp))
+                .padding(horizontal = 6.dp, vertical = 4.dp),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            listOf(".7" to "Ultrawide (0.5x)", "1x" to "Wide (1x)", "2" to "Telephoto (5x)").forEach { (label, lensName) ->
+                val isSel = selectedLens == lensName
+                Box(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(if (isSel) Color(0xFF4285F4) else Color.Transparent)
+                        .clickable { onLensChange(lensName) }
+                        .padding(horizontal = 14.dp, vertical = 6.dp)
+                ) {
+                    Text(
+                        text = label,
+                        color = if (isSel) Color.White else Color.Gray,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+        }
+
+        // --- 3. FULL-SCREEN INTERACTIVE CANVAS (FLOATING PHOTO FRAMES AND TARGET NODES) ---
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
@@ -1013,140 +1138,116 @@ fun CaptureScreen(
             val width = size.width
             val height = size.height
 
-            // Uniform pixel degree mapping scaling factor
-            val hFov = 48f
-            val scale = width / hFov
-
-            // Center workspace coordinate anchor
             val cx = width / 2f
             val cy = height / 2f
+            val focalScale = width * 1.5f
 
-            // 1. PROJECT FLOATING IMAGES & 3D GEODESIC POINTS
-            // Apply opposite device roll rotation around screen center, stabilizing graphics to gravity
-            rotate(degrees = -currentRoll, pivot = Offset(cx, cy)) {
-                nodes.forEach { node ->
-                    if (node.id == activeNodeIdInBurst) return@forEach
+            // Project and draw the 3D target nodes
+            activeNodes.forEach { node ->
+                if (node.id == activeNodeIdInBurst) return@forEach
+
+                // Node spherical directory to 3D unit coordinates
+                val nyRad = Math.toRadians(node.targetYaw.toDouble()).toFloat()
+                val npRad = Math.toRadians(node.targetPitch.toDouble()).toFloat()
+
+                val nx = cos(npRad) * sin(nyRad)
+                val ny = sin(npRad)
+                val nz = cos(npRad) * cos(nyRad)
+
+                val pt = project3DPoint(nx, ny, nz, cyRad, cpRad, crRad, width, height, focalScale)
+                if (pt != null) {
+                    val px = pt.x
+                    val py = pt.y
 
                     var diffYaw = node.targetYaw - currentYaw
                     while (diffYaw > 180f) diffYaw -= 360f
                     while (diffYaw < -180f) diffYaw += 360f
-
                     val diffPitch = node.targetPitch - currentPitch
 
-                    val px = cx + (diffYaw * scale)
-                    val py = cy - (diffPitch * scale)
+                    if (node.captured) {
+                        // Floating Captured Image Frame in Air
+                        val cardW = 120.dp.toPx()
+                        val cardH = 180.dp.toPx()
 
-                    val distDeg = sqrt(diffYaw * diffYaw + diffPitch * diffPitch)
-                    if (distDeg < 55f) {
-                        if (node.captured) {
-                            // --- FLOATING IMAGE FRAME PROJECTED IN 3D SPACE ---
-                            // Beautiful bounding rectangle representing the captured photo frame pinned in air!
-                            val cardW = 126.dp.toPx()
-                            val cardH = 189.dp.toPx()
+                        drawRect(
+                            color = Color(0xFF1E212A).copy(alpha = 0.28f),
+                            topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
+                            size = Size(cardW, cardH)
+                        )
+                        drawRect(
+                            color = Color.White.copy(alpha = 0.45f),
+                            topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
+                            size = Size(cardW, cardH),
+                            style = Stroke(width = 1.5.dp.toPx())
+                        )
+                        drawCircle(
+                            color = Color(0xFF34A853),
+                            radius = 9.dp.toPx(),
+                            center = Offset(px, py)
+                        )
+                        drawLine(
+                            color = Color.White,
+                            start = Offset(px - 4.dp.toPx(), py),
+                            end = Offset(px - 1.dp.toPx(), py + 3.dp.toPx()),
+                            strokeWidth = 2.dp.toPx()
+                        )
+                        drawLine(
+                            color = Color.White,
+                            start = Offset(px - 1.dp.toPx(), py + 3.dp.toPx()),
+                            end = Offset(px + 4.dp.toPx(), py - 3.dp.toPx()),
+                            strokeWidth = 2.dp.toPx()
+                        )
+                    } else {
+                        // Guide point circle target
+                        val isAligned = abs(diffYaw) < alignmentTolerance && abs(diffPitch) < alignmentTolerance
+                        val activeDotColor = if (isAligned) Color(0xFF34A853) else Color(0xFF4285F4)
 
-                            // Gentle grey backdrop representing mapped coordinate field
-                            drawRect(
-                                color = Color(0xFF23252C).copy(alpha = 0.22f),
-                                topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
-                                size = Size(cardW, cardH)
-                            )
-                            // White border stroke outline
-                            drawRect(
-                                color = Color.White.copy(alpha = 0.45f),
-                                topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
-                                size = Size(cardW, cardH),
-                                style = Stroke(width = 1.dp.toPx())
-                            )
-                            // Clean indicator circle with vector checkmark inside pinned frame
-                            drawCircle(
-                                color = Color(0xFF4285F4),
-                                radius = 9.dp.toPx(),
-                                center = Offset(px, py + cardH / 2f - 24.dp.toPx())
-                            )
-                            drawLine(
-                                color = Color.White,
-                                start = Offset(px - 4.dp.toPx(), py + cardH / 2f - 24.dp.toPx()),
-                                end = Offset(px - 1.dp.toPx(), py + cardH / 2f - 21.dp.toPx()),
-                                strokeWidth = 2.dp.toPx()
-                            )
-                            drawLine(
-                                color = Color.White,
-                                start = Offset(px - 1.dp.toPx(), py + cardH / 2f - 21.dp.toPx()),
-                                end = Offset(px + 4.dp.toPx(), py + cardH / 2f - 26.dp.toPx()),
-                                strokeWidth = 2.dp.toPx()
-                            )
+                        val dotRadius = if (totalCaptured == 0) {
+                            if (isAligned) 18.dp.toPx() else 14.dp.toPx()
                         } else {
-                            // --- BLUE GUIDE DOT SYSTEM ---
-                            val isAligned = abs(diffYaw) < 1.8f && abs(diffPitch) < 1.8f
-                            val activeDotColor = if (isAligned) Color(0xFF34A853) else Color(0xFF4285F4)
-
-                            // Target core solid dot
-                            drawCircle(
-                                color = activeDotColor,
-                                radius = if (isAligned) 14.dp.toPx() else 9.dp.toPx(),
-                                center = Offset(px, py)
-                            )
-
-                            // Target alignment ripple halo
-                            if (distDeg < 25f) {
-                                drawCircle(
-                                    color = activeDotColor.copy(alpha = 0.35f),
-                                    radius = if (isAligned) 22.dp.toPx() else 17.dp.toPx(),
-                                    center = Offset(px, py),
-                                    style = Stroke(width = 1.5f)
-                                )
-                            }
+                            if (isAligned) 13.dp.toPx() else 9.dp.toPx()
                         }
+
+                        // Orbiting ripple circle
+                        val pulse = 1f + sin(System.currentTimeMillis() * 0.005f) * 0.12f
+                        drawCircle(
+                            color = activeDotColor.copy(alpha = 0.22f),
+                            radius = (dotRadius + 10.dp.toPx()) * pulse,
+                            center = Offset(px, py)
+                        )
+                        // Core dot
+                        drawCircle(
+                            color = activeDotColor,
+                            radius = dotRadius,
+                            center = Offset(px, py)
+                        )
                     }
                 }
             }
 
-            // 2. CENTRAL STATIONARY WHITE RETICLE (LOCKED IN SCREEN CENTER)
-            // Stays fixed inside the vertical camera card viewport
+            // Stationary central reticle
             drawCircle(
-                color = Color.White.copy(alpha = 0.7f),
-                radius = 30.dp.toPx(),
+                color = Color.White.copy(alpha = 0.85f),
+                radius = 32.dp.toPx(),
                 center = Offset(cx, cy),
-                style = Stroke(width = 2.5f)
+                style = Stroke(width = 2.5.dp.toPx())
             )
 
-            // Dynamic leveling gauges (Yellow horizon lines rotating and sliding offset from pitch/roll)
-            val rollRad = Math.toRadians(currentRoll.toDouble()).toFloat()
-            val deltaYPitch = currentPitch * 2.5f
+            // Dynamic progress ring filling up when aligning
+            if (alignmentProgress > 0f) {
+                drawArc(
+                    color = Color(0xFF34A853),
+                    startAngle = -90f,
+                    sweepAngle = 360f * alignmentProgress,
+                    useCenter = false,
+                    topLeft = Offset(cx - 32.dp.toPx(), cy - 32.dp.toPx()),
+                    size = Size(64.dp.toPx(), 64.dp.toPx()),
+                    style = Stroke(width = 4.dp.toPx())
+                )
+            }
 
-            val gaugeLen = 32.dp.toPx()
-            val gaugeGap = 36.dp.toPx()
-            val cosR = cos(rollRad)
-            val sinR = sin(rollRad)
-
-            val leftStartX = cx - (gaugeGap + gaugeLen) * cosR + deltaYPitch * sinR
-            val leftStartY = cy - (gaugeGap + gaugeLen) * sinR - deltaYPitch * cosR
-            val leftEndX = cx - gaugeGap * cosR + deltaYPitch * sinR
-            val leftEndY = cy - gaugeGap * sinR - deltaYPitch * cosR
-
-            val rightStartX = cx + gaugeGap * cosR + deltaYPitch * sinR
-            val rightStartY = cy + gaugeGap * sinR - deltaYPitch * cosR
-            val rightEndX = cx + (gaugeGap + gaugeLen) * cosR + deltaYPitch * sinR
-            val rightEndY = cy + (gaugeGap + gaugeLen) * sinR - deltaYPitch * cosR
-
-            val isLeveled = abs(currentRoll) < 1.0f && abs(currentPitch) < 1.0f
-            val gaugeColor = if (isLeveled) Color(0xFF34A853) else Color(0xFFFBB03B)
-
-            drawLine(
-                color = gaugeColor,
-                start = Offset(leftStartX, leftStartY),
-                end = Offset(leftEndX, leftEndY),
-                strokeWidth = 2.dp.toPx()
-            )
-            drawLine(
-                color = gaugeColor,
-                start = Offset(rightStartX, rightStartY),
-                end = Offset(rightEndX, rightEndY),
-                strokeWidth = 2.dp.toPx()
-            )
-
-            // 3. GLOWING NAVIGATION ARROW TOWARDS NEAREST TARGET
-            val closestTarget = nodes.filter { !it.captured }.minByOrNull { node ->
+            // Central crosshair guide chevrons pointing towards nearest uncaptured dot
+            val closestTarget = activeNodes.filter { !it.captured }.minByOrNull { node ->
                 var dy = node.targetYaw - currentYaw
                 while (dy > 180f) dy -= 360f
                 while (dy < -180f) dy += 360f
@@ -1161,18 +1262,18 @@ fun CaptureScreen(
                 val dp = node.targetPitch - currentPitch
 
                 val dist = sqrt(dy * dy + dp * dp)
-                if (dist > 1.8f) {
+                if (dist > alignmentTolerance) {
                     val angleRad = atan2(-dp, dy)
-                    val arrowRadius = 110.dp.toPx()
+                    val arrowRadius = 100.dp.toPx()
                     val arrowCenterX = cx + cos(angleRad) * arrowRadius
                     val arrowCenterY = cy + sin(angleRad) * arrowRadius
                     val angleDeg = Math.toDegrees(angleRad.toDouble()).toFloat()
 
                     rotate(degrees = angleDeg, pivot = Offset(arrowCenterX, arrowCenterY)) {
                         val arrowPath = AndroidPath().apply {
-                            moveTo(arrowCenterX + 10.dp.toPx(), arrowCenterY)
-                            lineTo(arrowCenterX - 8.dp.toPx(), arrowCenterY - 6.dp.toPx())
-                            lineTo(arrowCenterX - 8.dp.toPx(), arrowCenterY + 6.dp.toPx())
+                            moveTo(arrowCenterX + 12.dp.toPx(), arrowCenterY)
+                            lineTo(arrowCenterX - 8.dp.toPx(), arrowCenterY - 7.dp.toPx())
+                            lineTo(arrowCenterX - 8.dp.toPx(), arrowCenterY + 7.dp.toPx())
                             close()
                         }
                         this.drawContext.canvas.nativeCanvas.drawPath(
@@ -1181,7 +1282,7 @@ fun CaptureScreen(
                                 color = AndroidColor.rgb(66, 133, 244)
                                 style = AndroidPaint.Style.FILL
                                 isAntiAlias = true
-                                setShadowLayer(6.dp.toPx(), 0f, 0f, AndroidColor.argb(160, 66, 133, 244))
+                                setShadowLayer(8.dp.toPx(), 0f, 0f, AndroidColor.argb(180, 66, 133, 244))
                             }
                         )
                     }
@@ -1189,46 +1290,31 @@ fun CaptureScreen(
             }
         }
 
-        // --- 4. TOP TEXT INSTRUCTIONS HUD BANNER ---
-        Box(
+        // --- 4. TOP-LEFT TEXT INSTRUCTIONS HUD BANNER ---
+        Column(
             modifier = Modifier
-                .fillMaxWidth()
-                .padding(top = 80.dp),
-            contentAlignment = Alignment.TopCenter
+                .align(Alignment.TopStart)
+                .padding(top = 54.dp, start = 24.dp)
         ) {
             val textGuide = if (totalCaptured == 0) {
                 "To start, keep dot inside circle"
             } else {
                 "Swipe screen or look around to map sectors"
             }
-
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.65f)),
-                shape = RoundedCornerShape(20.dp),
-                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.15f)),
-                modifier = Modifier.padding(horizontal = 24.dp)
-            ) {
-                Row(
-                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    if (totalCaptured == 0) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .background(Color(0xFF4285F4), CircleShape)
-                        )
-                    }
-                    Text(
-                        text = textGuide,
-                        color = Color.White,
-                        fontSize = 12.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 0.2.sp
-                    )
-                }
-            }
+            Text(
+                text = textGuide,
+                color = Color.White,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.2.sp
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Text(
+                text = "Captured: $totalCaptured / ${nodes.size} sectors",
+                color = Color.White.copy(alpha = 0.6f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
         }
 
         // --- 5. CAMERA SHUTTER BLINK FADE OVERLAY ---
@@ -1248,7 +1334,7 @@ fun CaptureScreen(
                 contentAlignment = Alignment.Center
             ) {
                 Card(
-                    colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.88f)),
+                    colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.9f)),
                     shape = RoundedCornerShape(16.dp),
                     border = BorderStroke(1.dp, Color(0xFF4285F4)),
                     modifier = Modifier.size(150.dp)
@@ -1273,25 +1359,25 @@ fun CaptureScreen(
         }
 
         // --- 7. CONFIGURABLE PREFERENCES OVERLAY DRAWER ---
-        AnimatedVisibility(
-            visible = isSettingsOverlayOpen,
-            enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
-            exit = slideOutVertically(targetOffsetY = { -it }) + fadeOut(),
-            modifier = Modifier
-                .fillMaxWidth()
-                .align(Alignment.TopCenter)
-                .padding(top = 68.dp, start = 14.dp, end = 14.dp)
-        ) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF13151D).copy(alpha = 0.96f)),
-                shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.dp, Color(0xFF4285F4).copy(alpha = 0.5f)),
+        if (isSettingsOverlayOpen) {
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .testTag("preferences_drawer_card")
+                    .align(Alignment.TopCenter)
+                    .padding(top = 68.dp, start = 14.dp, end = 14.dp)
             ) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF13151D).copy(alpha = 0.96f)),
+                    shape = RoundedCornerShape(16.dp),
+                    border = BorderStroke(1.dp, Color(0xFF4285F4).copy(alpha = 0.5f)),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .testTag("preferences_drawer_card")
+                ) {
                 Column(
-                    modifier = Modifier.padding(16.dp),
+                    modifier = Modifier
+                        .padding(16.dp)
+                        .verticalScroll(rememberScrollState()),
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Row(
@@ -1335,7 +1421,100 @@ fun CaptureScreen(
                         )
                     }
 
-                    // 2. HDR+ Burst Strength
+                    // 2. Alignment Delay ms
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1.2f)) {
+                            Text("Target Lock Delay", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Delay pointed before capture", color = Color.Gray, fontSize = 9.sp)
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.weight(1.5f)
+                        ) {
+                            listOf(200 to "200ms", 500 to "500ms", 1000 to "1.0s", 2000 to "2.0s").forEach { (ms, lbl) ->
+                                val isSel = ms == autoCaptureDelayMs
+                                Button(
+                                    onClick = { onAutoCaptureDelayMsChange(ms) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isSel) Color(0xFF4285F4) else Color(0xFF242731),
+                                        contentColor = if (isSel) Color.White else Color.LightGray
+                                    ),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+                                    modifier = Modifier.weight(1f).height(24.dp)
+                                ) {
+                                    Text(lbl, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Grid Cross Density
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1.2f)) {
+                            Text("SLAM Grid Density", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Floor spatial crosses density", color = Color.Gray, fontSize = 9.sp)
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.weight(1.5f)
+                        ) {
+                            listOf("Low", "Normal", "High", "Max").forEach { density ->
+                                val isSel = density == slamGridDensity
+                                Button(
+                                    onClick = { onSlamGridDensityChange(density) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isSel) Color(0xFF4285F4) else Color(0xFF242731),
+                                        contentColor = if (isSel) Color.White else Color.LightGray
+                                    ),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+                                    modifier = Modifier.weight(1f).height(24.dp)
+                                ) {
+                                    Text(density, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+
+                    // 4. Locking Tolerance
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1.2f)) {
+                            Text("Lock Angle Tolerance", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Locking segment radius degree", color = Color.Gray, fontSize = 9.sp)
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.weight(1.5f)
+                        ) {
+                            listOf(1.0f to "1.0°", 1.8f to "1.8°", 3.0f to "3.0°").forEach { (tol, lbl) ->
+                                val isSel = abs(tol - alignmentTolerance) < 0.1f
+                                Button(
+                                    onClick = { onAlignmentToleranceChange(tol) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isSel) Color(0xFF4285F4) else Color(0xFF242731),
+                                        contentColor = if (isSel) Color.White else Color.LightGray
+                                    ),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+                                    modifier = Modifier.weight(1f).height(24.dp)
+                                ) {
+                                    Text(lbl, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+
+                    // 5. HDR+ Burst Strength
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
@@ -1366,7 +1545,7 @@ fun CaptureScreen(
                         }
                     }
 
-                    // 3. Audio Trigger selector
+                    // 6. Audio Trigger selector
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
@@ -1402,7 +1581,7 @@ fun CaptureScreen(
                         }
                     }
 
-                    // 4. Vibration Haptic
+                    // 7. Vibration Haptic
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
@@ -1462,7 +1641,6 @@ fun CaptureScreen(
 
                     Spacer(modifier = Modifier.height(4.dp))
 
-                    // Reset captured grid action inside settings drawers!
                     Button(
                         onClick = {
                             onResetCapture()
@@ -1479,6 +1657,7 @@ fun CaptureScreen(
                 }
             }
         }
+    }
 
         // --- 8. HUD MINI FLOATING HEADER UTILITIES ---
         Row(
@@ -1488,7 +1667,6 @@ fun CaptureScreen(
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            // Little indicator badge
             Card(
                 colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.55f)),
                 shape = RoundedCornerShape(8.dp)
@@ -1504,7 +1682,7 @@ fun CaptureScreen(
                             .background(if (isSensorActive && !isManualSwipeMode) Color(0xFF34A853) else Color(0xFFFFB74D), CircleShape)
                     )
                     Text(
-                        text = "Y: ${String.format("%.0f", currentYaw)}° P: ${String.format("%.0f", currentPitch)}°",
+                        text = "Y: ${String.format("%.0f", currentYaw)}° P: ${String.format("%.0f", currentPitch)}° R: ${String.format("%.0f", currentRoll)}°",
                         color = Color.White,
                         fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace
@@ -1512,7 +1690,6 @@ fun CaptureScreen(
                 }
             }
 
-            // Quick utility buttons
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1538,28 +1715,11 @@ fun CaptureScreen(
             }
         }
 
-        // --- 9. CENTRAL TIMED MANUAL OVERRIDE ALIGNMENT SNAPPERS ---
-        // Helpful button float right above bottom console to easily trigger capture manually on clicked
-        val nextTargetNode = nodes.firstOrNull { node ->
-            if (node.captured) return@firstOrNull false
-            var diffYaw = node.targetYaw - currentYaw
-            while (diffYaw > 180f) diffYaw -= 360f
-            while (diffYaw < -180f) diffYaw += 360f
-            val diffPitch = node.targetPitch - currentPitch
-            abs(diffYaw) < 1.8f && abs(diffPitch) < 1.8f
-        }
-
-        // Auto Capture effect watcher
-        LaunchedEffect(nextTargetNode) {
-            if (nextTargetNode != null && autoCaptureEnabled && activeNodeIdInBurst == null) {
-                onTriggerBurstCapture(nextTargetNode)
-            }
-        }
-
+        // --- 9. CENTRAL FORCE CAPTURE SHUTTER SNAPPERS ---
         if (nextTargetNode == null && totalCaptured < nodes.size) {
             Button(
                 onClick = {
-                    val closest = nodes.filter { !it.captured }.minByOrNull {
+                    val closest = activeNodes.filter { !it.captured }.minByOrNull {
                         var dy = it.targetYaw - currentYaw
                         while (dy > 180f) dy -= 360f
                         while (dy < -180f) dy += 360f
@@ -1567,100 +1727,83 @@ fun CaptureScreen(
                     }
                     closest?.let { onTriggerBurstCapture(it) }
                 },
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEA4335).copy(alpha = 0.85f)),
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF34A853).copy(alpha = 0.85f)),
                 shape = RoundedCornerShape(20.dp),
                 border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
                 contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
                 modifier = Modifier
                     .align(Alignment.BottomCenter)
-                    .padding(bottom = 120.dp)
+                    .padding(bottom = 150.dp)
                     .testTag("manual_shutter_btn")
             ) {
                 Icon(Icons.Default.Camera, contentDescription = "Snap Align", modifier = Modifier.size(14.dp))
                 Spacer(modifier = Modifier.width(6.dp))
-                Text("Force Lock Current Sector", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                Text("Lock Nearest Sector", fontSize = 11.sp, fontWeight = FontWeight.Bold)
             }
         }
 
-        // --- 10. GCAM CLASSIC THREE-BUTTON BOTTOM BAR CONSOLE ---
-        // Complete solid dark bar featuring Revert, green double check, and cancel exit
-        Box(
+        // --- 10. GCAM CLASSIC THREE-BUTTON BOTTOM BAR CONSOLE (Floating round buttons) ---
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Color(0xFF1E1F24))
-                .padding(vertical = 24.dp)
+                .padding(bottom = 44.dp, start = 48.dp, end = 48.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
+            // Far Left: Undo Last Capture button
+            IconButton(
+                onClick = onUndoLastCapture,
+                enabled = totalCaptured > 0,
                 modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 40.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                    .size(56.dp)
+                    .border(1.5.dp, if (totalCaptured > 0) Color.White else Color.White.copy(alpha = 0.2f), CircleShape)
+                    .background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                    .testTag("capture_undo_button")
             ) {
-                // Far Left: Undo / Revert Last Capture button
-                IconButton(
-                    onClick = onUndoLastCapture,
-                    enabled = totalCaptured > 0,
-                    modifier = Modifier
-                        .size(54.dp)
-                        .background(
-                            if (totalCaptured > 0) Color(0xFF2F3035) else Color(0x222F3035),
-                            CircleShape
-                        )
-                        .testTag("capture_undo_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Undo,
-                        contentDescription = "Undo Last Captured Node",
-                        tint = if (totalCaptured > 0) Color.White else Color.Gray,
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
+                Icon(
+                    imageVector = Icons.Default.Undo,
+                    contentDescription = "Undo Last Captured Node",
+                    tint = if (totalCaptured > 0) Color.White else Color.White.copy(alpha = 0.2f),
+                    modifier = Modifier.size(24.dp)
+                )
+            }
 
-                // Middle: Stitch and Done Checkmark button inside white-outlined circular ring
-                Box(
-                    modifier = Modifier
-                        .size(72.dp)
-                        .background(Color.Transparent, CircleShape)
-                        .border(4.dp, Color.White, CircleShape),
-                    contentAlignment = Alignment.Center
-                ) {
-                    IconButton(
-                        onClick = onStartStitching,
-                        enabled = totalCaptured > 0,
-                        modifier = Modifier
-                            .size(56.dp)
-                            .background(
-                                if (totalCaptured > 0) Color(0xFF34A853) else Color(0x3334A853),
-                                CircleShape
-                            )
-                            .testTag("stitch_now_btn")
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Check,
-                            contentDescription = "Confirm Stitching",
-                            tint = if (totalCaptured > 0) Color.White else Color.White.copy(alpha = 0.35f),
-                            modifier = Modifier.size(28.dp)
-                        )
-                    }
-                }
+            // Middle: Stitch and Done Checkmark button inside gorgeous blue circular ring
+            Box(
+                modifier = Modifier
+                    .size(80.dp)
+                    .border(3.dp, Color.White, CircleShape)
+                    .padding(4.dp)
+                    .clip(CircleShape)
+                    .background(if (totalCaptured > 0) Color(0xFF4285F4) else Color(0x334285F4))
+                    .clickable(enabled = totalCaptured > 0) { onStartStitching() }
+                    .testTag("stitch_now_btn"),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Check,
+                    contentDescription = "Confirm Stitching",
+                    tint = Color.White,
+                    modifier = Modifier.size(36.dp)
+                )
+            }
 
-                // Far Right: Exit / Cancel button
-                IconButton(
-                    onClick = onBack,
-                    modifier = Modifier
-                        .size(54.dp)
-                        .background(Color(0xFF2F3035), CircleShape)
-                        .testTag("capture_close_button")
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Exit Capture",
-                        tint = Color.White,
-                        modifier = Modifier.size(22.dp)
-                    )
-                }
+            // Far Right: Exit / Cancel button
+            IconButton(
+                onClick = onBack,
+                modifier = Modifier
+                    .size(56.dp)
+                    .border(1.5.dp, Color.White, CircleShape)
+                    .background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                    .testTag("capture_close_button")
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Close,
+                    contentDescription = "Exit Capture",
+                    tint = Color.White,
+                    modifier = Modifier.size(24.dp)
+                )
             }
         }
     }
