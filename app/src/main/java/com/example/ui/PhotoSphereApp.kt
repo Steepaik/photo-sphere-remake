@@ -40,6 +40,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -357,6 +358,14 @@ fun PhotoSphereApp() {
                         },
                         onBack = {
                             currentScreen = AppScreen.DASHBOARD
+                        },
+                        onUndoLastCapture = {
+                            val lastCaptured = nodesList.filter { it.captured }.lastOrNull()
+                            if (lastCaptured != null) {
+                                nodesList = nodesList.map {
+                                    if (it.id == lastCaptured.id) it.copy(captured = false, capturedProgress = 0f) else it
+                                }
+                            }
                         }
                     )
                 }
@@ -830,9 +839,7 @@ fun DashboardScreen(
         }
     }
 }
-
-
-// ------------------ 2. CAMERA CAPTURE VIEWFINDER ------------------
+        // ------------------ 2. CAMERA CAPTURE VIEWFINDER ------------------
 @Composable
 fun CaptureScreen(
     selectedLens: String,
@@ -862,82 +869,133 @@ fun CaptureScreen(
     onTriggerBurstCapture: (PhotoSphereNode) -> Unit,
     onResetCapture: () -> Unit,
     onStartStitching: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onUndoLastCapture: () -> Unit
 ) {
     val context = LocalContext.current
     val totalCaptured = nodes.filter { it.captured }.size
     val totalProgress = totalCaptured.toFloat() / nodes.size
-    var isSettingsOverlayOpen by remember { mutableStateFlowState(false) }
+    var isSettingsOverlayOpen by remember { mutableStateOf(false) }
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(Color.Black)
+            .background(Color(0xFF090A0E))
     ) {
-        // --- LIVE PREVIEW AREA ---
-        if (!isManualSwipeMode && ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            CameraXPreviewView(modifier = Modifier.fillMaxSize())
-        } else {
-            // High fidelity scenic starry grid representation for simulator fallback
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .drawBehind {
-                        // Drawing static starry deep space grid matching current simulated yaw/pitch panning offsets
-                        drawRect(Color(0xFF0C0D13))
-                        val starPainter = AndroidPaint().apply {
-                            color = AndroidColor.WHITE
-                            style = AndroidPaint.Style.FILL
-                        }
-                        val linePainter = AndroidPaint().apply {
-                            color = AndroidColor.argb(20, 255, 255, 255)
-                            style = AndroidPaint.Style.STROKE
-                            strokeWidth = 2f
-                        }
+        // --- 1. PERSPECTIVE 3D GROUND PLANE OF CROSSES ---
+        // Renders the spatial SLAM coordinate floor matrix stretching in 3D perspective
+        Canvas(
+            modifier = Modifier.fillMaxSize()
+        ) {
+            val width = size.width
+            val height = size.height
 
-                        // Grid based on panoramic coordinates
-                        val spacingX = size.width / 40f
-                        val spacingY = size.height / 30f
-                        val offsetX = (currentYaw * 10f) % size.width
-                        val offsetY = (currentPitch * 10f) % size.height
+            val yawRad = Math.toRadians(currentYaw.toDouble()).toFloat()
+            val pitchRad = Math.toRadians(currentPitch.toDouble()).toFloat()
+            val cosYaw = cos(yawRad)
+            val sinYaw = sin(yawRad)
+            val cosPitch = cos(pitchRad)
+            val sinPitch = sin(pitchRad)
 
-                        for (i in -10..50) {
-                            val lx = offsetX + i * spacingX
-                            drawLine(Color(0x11FFFFFF), Offset(lx, 0f), Offset(lx, size.height), 1f)
-                        }
-                        for (j in -10..40) {
-                            val ly = offsetY + j * spacingY
-                            drawLine(Color(0x11FFFFFF), Offset(0f, ly), Offset(size.width, ly), 1f)
-                        }
+            // Ground origin point configuration: 1.3 meters below camera
+            val groundY = -1.3f
+            val focalScale = width * 1.15f
 
-                        // Drawing celestial star seeds inside simulator
-                        val random = java.util.Random(1337)
-                        for (k in 0..60) {
-                            val sx = (random.nextFloat() * size.width + currentYaw * 8f) % size.width
-                            val sy = (random.nextFloat() * size.height + currentPitch * 8f) % size.height
-                            drawCircle(
-                                Color.White.copy(alpha = random.nextFloat() * 0.6f + 0.2f),
-                                radius = random.nextFloat() * 2f + 1f,
-                                center = Offset(sx, sy)
+            // Iterate on a grid floor around coordinate space
+            for (gx in -8..8) {
+                for (gz in 1..12) {
+                    val worldX = gx * 0.9f
+                    val worldZ = gz * 0.9f
+
+                    // Rotate around vertical Y center (yaw angle)
+                    val x1 = worldX * cosYaw - worldZ * sinYaw
+                    val z1 = worldX * sinYaw + worldZ * cosYaw
+                    val y1 = groundY
+
+                    // Rotate around horizontal X center (pitch angle)
+                    val x2 = x1
+                    val y2 = y1 * cosPitch - z1 * sinPitch
+                    val z2 = y1 * sinPitch + z1 * cosPitch
+
+                    // Perspective projection division
+                    if (z2 > 0.15f) {
+                        val px = (width / 2f) + (x2 * focalScale) / z2
+                        val py = (height / 2f) - (y2 * focalScale) / z2
+
+                        if (px in 0f..width && py in 0f..height) {
+                            val depthAlpha = (1.0f - (z2 / 10f)).coerceIn(0.04f, 0.45f)
+                            val crossHalfSize = 4.dp.toPx()
+                            
+                            drawLine(
+                                color = Color.White.copy(alpha = depthAlpha),
+                                start = Offset(px - crossHalfSize, py),
+                                end = Offset(px + crossHalfSize, py),
+                                strokeWidth = 1.dp.toPx()
+                            )
+                            drawLine(
+                                color = Color.White.copy(alpha = depthAlpha),
+                                start = Offset(px, py - crossHalfSize),
+                                end = Offset(px, py + crossHalfSize),
+                                strokeWidth = 1.dp.toPx()
                             )
                         }
                     }
-                    .pointerInput(isManualSwipeMode) {
-                        if (isManualSwipeMode) {
-                            detectDragGestures { change, dragAmount ->
-                                change.consume()
-                                // Drag sensitivity converter mapping to yaw / pitch degrees
-                                val dy = dragAmount.x * 0.12f
-                                val dp = -dragAmount.y * 0.12f
-                                onSwipeDelta(dy, dp)
-                            }
-                        }
-                    }
-            )
+                }
+            }
         }
 
-        // --- SENSOR REGISTRATION TARGETS OVERLAY ---
-        // Projecting the 3D geodesic nodes onto the 2D viewfinder coordinate plane isotropically
+        // --- 2. ACTIVE CAMERA VIEWFINDER PORTRAIT CARD ---
+        // High fidelity centered screen mask representing the physical active lens viewport
+        Box(
+            modifier = Modifier
+                .size(width = 240.dp, height = 360.dp)
+                .align(Alignment.Center)
+                .clip(RoundedCornerShape(12.dp))
+                .border(2.dp, Color.White, RoundedCornerShape(11.dp))
+                .testTag("centered_camera_viewport")
+        ) {
+            if (!isManualSwipeMode && ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                CameraXPreviewView(modifier = Modifier.fillMaxSize())
+            } else {
+                // High contrast simulated viewfinder layout
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color(0xFF11131A))
+                ) {
+                    Canvas(modifier = Modifier.fillMaxSize()) {
+                        val w = size.width
+                        val h = size.height
+
+                        // Gentle gradient simulated skyline which shifts with yaw/pitch angles
+                        val panX = (currentYaw * 4f) % w
+                        val panY = (currentPitch * 4f) % h
+
+                        drawRect(
+                            brush = Brush.verticalGradient(
+                                colors = listOf(Color(0xFF1E2638), Color(0xFF0F121C))
+                            )
+                        )
+
+                        // Visual simulated background horizon landscape
+                        val landscapePath = androidx.compose.ui.graphics.Path().apply {
+                            moveTo(0f, h)
+                            lineTo(w * 0.25f, h * 0.45f + panY)
+                            lineTo(w * 0.65f, h * 0.65f + panY)
+                            lineTo(w * 0.85f, h * 0.35f + panY)
+                            lineTo(w, h)
+                            close()
+                        }
+                        drawPath(
+                            path = landscapePath,
+                            color = Color(0xFF333E54).copy(alpha = 0.4f)
+                        )
+                    }
+                }
+            }
+        }
+
+        // --- 3. FULL-SCREEN INTERACTIVE CANVAS (FLOATING PHOTO FRAMES AND TARGETS) ---
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
@@ -955,38 +1013,17 @@ fun CaptureScreen(
             val width = size.width
             val height = size.height
 
-            // 1. Uniform (isotropic) pixel scale to resolve stretching/warping
+            // Uniform pixel degree mapping scaling factor
             val hFov = 48f
             val scale = width / hFov
 
-            // Draw SIFT feature trackers popping over high contrast scenic spots (ambient)
-            val starSeed = 999L
-            val random = java.util.Random(starSeed)
-            for (idx in 0..12) {
-                val fx = random.nextFloat() * width
-                val fy = random.nextFloat() * height
-                if (random.nextBoolean()) {
-                    drawCircle(
-                        Color(0xFF34A853).copy(alpha = 0.25f),
-                        radius = 4f,
-                        center = Offset(fx, fy)
-                    )
-                    drawLine(
-                        Color(0xFF34A853).copy(alpha = 0.3f),
-                        Offset(fx - 6f, fy), Offset(fx + 6f, fy),
-                        1f
-                    )
-                    drawLine(
-                        Color(0xFF34A853).copy(alpha = 0.3f),
-                        Offset(fx, fy - 6f), Offset(fx, fy + 6f),
-                        1f
-                    )
-                }
-            }
+            // Center workspace coordinate anchor
+            val cx = width / 2f
+            val cy = height / 2f
 
-            // 2. COUNTERACT DEVICE ROLL TILT FOR REAL-WORLD ALIGNMENT
-            // Tapping rotate makes all the 3D spheres rotate in inverse roll, stabilizing them perfectly with real-world gravity!
-            rotate(degrees = -currentRoll, pivot = Offset(width / 2f, height / 2f)) {
+            // 1. PROJECT FLOATING IMAGES & 3D GEODESIC POINTS
+            // Apply opposite device roll rotation around screen center, stabilizing graphics to gravity
+            rotate(degrees = -currentRoll, pivot = Offset(cx, cy)) {
                 nodes.forEach { node ->
                     if (node.id == activeNodeIdInBurst) return@forEach
 
@@ -996,56 +1033,119 @@ fun CaptureScreen(
 
                     val diffPitch = node.targetPitch - currentPitch
 
-                    // Draw if within viewport angle (an isotropic circle of 40 degrees)
+                    val px = cx + (diffYaw * scale)
+                    val py = cy - (diffPitch * scale)
+
                     val distDeg = sqrt(diffYaw * diffYaw + diffPitch * diffPitch)
-                    if (distDeg < 40f) {
-                        val px = (width / 2f) + (diffYaw * scale)
-                        val py = (height / 2f) - (diffPitch * scale)
+                    if (distDeg < 55f) {
+                        if (node.captured) {
+                            // --- FLOATING IMAGE FRAME PROJECTED IN 3D SPACE ---
+                            // Beautiful bounding rectangle representing the captured photo frame pinned in air!
+                            val cardW = 126.dp.toPx()
+                            val cardH = 189.dp.toPx()
 
-                        val isAligned = abs(diffYaw) < 1.8f && abs(diffPitch) < 1.8f
-
-                        val ringColor = when {
-                            node.captured -> Color(0xFF4285F4)
-                            isAligned -> Color(0xFF34A853) // Green lock success!
-                            else -> Color.White.copy(alpha = 0.7f)
-                        }
-
-                        // Target core point
-                        drawCircle(
-                            color = ringColor,
-                            radius = if (isAligned) 14f else 8f,
-                            center = Offset(px, py)
-                        )
-
-                        // Outer alignment guide shell
-                        if (!node.captured) {
+                            // Gentle grey backdrop representing mapped coordinate field
+                            drawRect(
+                                color = Color(0xFF23252C).copy(alpha = 0.22f),
+                                topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
+                                size = Size(cardW, cardH)
+                            )
+                            // White border stroke outline
+                            drawRect(
+                                color = Color.White.copy(alpha = 0.45f),
+                                topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
+                                size = Size(cardW, cardH),
+                                style = Stroke(width = 1.dp.toPx())
+                            )
+                            // Clean indicator circle with vector checkmark inside pinned frame
                             drawCircle(
-                                color = ringColor.copy(alpha = 0.45f),
-                                radius = if (isAligned) 24f else 18f,
-                                center = Offset(px, py),
-                                style = Stroke(width = 2f)
+                                color = Color(0xFF4285F4),
+                                radius = 9.dp.toPx(),
+                                center = Offset(px, py + cardH / 2f - 24.dp.toPx())
+                            )
+                            drawLine(
+                                color = Color.White,
+                                start = Offset(px - 4.dp.toPx(), py + cardH / 2f - 24.dp.toPx()),
+                                end = Offset(px - 1.dp.toPx(), py + cardH / 2f - 21.dp.toPx()),
+                                strokeWidth = 2.dp.toPx()
+                            )
+                            drawLine(
+                                color = Color.White,
+                                start = Offset(px - 1.dp.toPx(), py + cardH / 2f - 21.dp.toPx()),
+                                end = Offset(px + 4.dp.toPx(), py + cardH / 2f - 26.dp.toPx()),
+                                strokeWidth = 2.dp.toPx()
                             )
                         } else {
-                            // Draw vector checkmark inside captured points
-                            drawLine(
-                                color = Color.White,
-                                start = Offset(px - 4f, py),
-                                end = Offset(px - 1f, py + 3f),
-                                strokeWidth = 2.5f
+                            // --- BLUE GUIDE DOT SYSTEM ---
+                            val isAligned = abs(diffYaw) < 1.8f && abs(diffPitch) < 1.8f
+                            val activeDotColor = if (isAligned) Color(0xFF34A853) else Color(0xFF4285F4)
+
+                            // Target core solid dot
+                            drawCircle(
+                                color = activeDotColor,
+                                radius = if (isAligned) 14.dp.toPx() else 9.dp.toPx(),
+                                center = Offset(px, py)
                             )
-                            drawLine(
-                                color = Color.White,
-                                start = Offset(px - 1f, py + 3f),
-                                end = Offset(px + 5f, py - 3f),
-                                strokeWidth = 2.5f
-                            )
+
+                            // Target alignment ripple halo
+                            if (distDeg < 25f) {
+                                drawCircle(
+                                    color = activeDotColor.copy(alpha = 0.35f),
+                                    radius = if (isAligned) 22.dp.toPx() else 17.dp.toPx(),
+                                    center = Offset(px, py),
+                                    style = Stroke(width = 1.5f)
+                                )
+                            }
                         }
                     }
                 }
             }
 
-            // 3. GLOWING NAVIGATION ARROW GUIDANCE TOWARDS THE NEAREST UNCAPTURED TILE
-            // Drawing the arrow OUTSIDE the roll rotation block so it stays strictly aligned with the camera's frame/reticle
+            // 2. CENTRAL STATIONARY WHITE RETICLE (LOCKED IN SCREEN CENTER)
+            // Stays fixed inside the vertical camera card viewport
+            drawCircle(
+                color = Color.White.copy(alpha = 0.7f),
+                radius = 30.dp.toPx(),
+                center = Offset(cx, cy),
+                style = Stroke(width = 2.5f)
+            )
+
+            // Dynamic leveling gauges (Yellow horizon lines rotating and sliding offset from pitch/roll)
+            val rollRad = Math.toRadians(currentRoll.toDouble()).toFloat()
+            val deltaYPitch = currentPitch * 2.5f
+
+            val gaugeLen = 32.dp.toPx()
+            val gaugeGap = 36.dp.toPx()
+            val cosR = cos(rollRad)
+            val sinR = sin(rollRad)
+
+            val leftStartX = cx - (gaugeGap + gaugeLen) * cosR + deltaYPitch * sinR
+            val leftStartY = cy - (gaugeGap + gaugeLen) * sinR - deltaYPitch * cosR
+            val leftEndX = cx - gaugeGap * cosR + deltaYPitch * sinR
+            val leftEndY = cy - gaugeGap * sinR - deltaYPitch * cosR
+
+            val rightStartX = cx + gaugeGap * cosR + deltaYPitch * sinR
+            val rightStartY = cy + gaugeGap * sinR - deltaYPitch * cosR
+            val rightEndX = cx + (gaugeGap + gaugeLen) * cosR + deltaYPitch * sinR
+            val rightEndY = cy + (gaugeGap + gaugeLen) * sinR - deltaYPitch * cosR
+
+            val isLeveled = abs(currentRoll) < 1.0f && abs(currentPitch) < 1.0f
+            val gaugeColor = if (isLeveled) Color(0xFF34A853) else Color(0xFFFBB03B)
+
+            drawLine(
+                color = gaugeColor,
+                start = Offset(leftStartX, leftStartY),
+                end = Offset(leftEndX, leftEndY),
+                strokeWidth = 2.dp.toPx()
+            )
+            drawLine(
+                color = gaugeColor,
+                start = Offset(rightStartX, rightStartY),
+                end = Offset(rightEndX, rightEndY),
+                strokeWidth = 2.dp.toPx()
+            )
+
+            // 3. GLOWING NAVIGATION ARROW TOWARDS NEAREST TARGET
             val closestTarget = nodes.filter { !it.captured }.minByOrNull { node ->
                 var dy = node.targetYaw - currentYaw
                 while (dy > 180f) dy -= 360f
@@ -1060,33 +1160,28 @@ fun CaptureScreen(
                 while (dy < -180f) dy += 360f
                 val dp = node.targetPitch - currentPitch
 
-                val dist = sqrt(dy*dy + dp*dp)
+                val dist = sqrt(dy * dy + dp * dp)
                 if (dist > 1.8f) {
-                    // Calculate screenspace direction angle in radians
                     val angleRad = atan2(-dp, dy)
-
-                    // Position arrow along reticle perimeter (e.g., radius of 110f around center)
-                    val arrowRadius = 110f
-                    val arrowCenterX = width / 2f + cos(angleRad) * arrowRadius
-                    val arrowCenterY = height / 2f + sin(angleRad) * arrowRadius
-
+                    val arrowRadius = 110.dp.toPx()
+                    val arrowCenterX = cx + cos(angleRad) * arrowRadius
+                    val arrowCenterY = cy + sin(angleRad) * arrowRadius
                     val angleDeg = Math.toDegrees(angleRad.toDouble()).toFloat()
 
-                    // Render beautiful triangle arrow rotatably aligned
                     rotate(degrees = angleDeg, pivot = Offset(arrowCenterX, arrowCenterY)) {
                         val arrowPath = AndroidPath().apply {
-                            moveTo(arrowCenterX + 14f, arrowCenterY)
-                            lineTo(arrowCenterX - 10f, arrowCenterY - 9f)
-                            lineTo(arrowCenterX - 10f, arrowCenterY + 9f)
+                            moveTo(arrowCenterX + 10.dp.toPx(), arrowCenterY)
+                            lineTo(arrowCenterX - 8.dp.toPx(), arrowCenterY - 6.dp.toPx())
+                            lineTo(arrowCenterX - 8.dp.toPx(), arrowCenterY + 6.dp.toPx())
                             close()
                         }
                         this.drawContext.canvas.nativeCanvas.drawPath(
                             arrowPath,
                             AndroidPaint().apply {
-                                color = AndroidColor.rgb(66, 133, 244) // Google Camera Brand Blue
+                                color = AndroidColor.rgb(66, 133, 244)
                                 style = AndroidPaint.Style.FILL
                                 isAntiAlias = true
-                                setShadowLayer(10f, 0f, 0f, AndroidColor.argb(200, 66, 133, 244))
+                                setShadowLayer(6.dp.toPx(), 0f, 0f, AndroidColor.argb(160, 66, 133, 244))
                             }
                         )
                     }
@@ -1094,189 +1189,69 @@ fun CaptureScreen(
             }
         }
 
-        // --- LEVELING CALIBRATION HORIZON HUD & FLOATING GUIDANCE PIL --
-        // Classic yellow & white overlapping horizon alignment gauges from GCam plus real-time panic instructions
+        // --- 4. TOP TEXT INSTRUCTIONS HUD BANNER ---
         Box(
             modifier = Modifier
-                .fillMaxSize()
-                .padding(bottom = 70.dp),
-            contentAlignment = Alignment.Center
+                .fillMaxWidth()
+                .padding(top = 80.dp),
+            contentAlignment = Alignment.TopCenter
         ) {
-            Column(
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(16.dp)
+            val textGuide = if (totalCaptured == 0) {
+                "To start, keep dot inside circle"
+            } else {
+                "Swipe screen or look around to map sectors"
+            }
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.65f)),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.15f)),
+                modifier = Modifier.padding(horizontal = 24.dp)
             ) {
-                Canvas(
-                    modifier = Modifier.size(240.dp)
+                Row(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val cx = size.width / 2f
-                    val cy = size.height / 2f
-
-                    // Central high target bounding ring (GCam Reticle lock target)
-                    drawCircle(
-                        color = Color.White.copy(alpha = 0.25f),
-                        radius = 35f,
-                        center = Offset(cx, cy),
-                        style = Stroke(width = 1.5f)
-                    )
-
-                    // 1. White fixed horizontal leveler indicator (pitch zero baseline)
-                    drawLine(
-                        color = Color.White.copy(alpha = 0.3f),
-                        start = Offset(cx - 80f, cy),
-                        end = Offset(cx - 40f, cy),
-                        strokeWidth = 2f
-                    )
-                    drawLine(
-                        color = Color.White.copy(alpha = 0.3f),
-                        start = Offset(cx + 40f, cy),
-                        end = Offset(cx + 80f, cy),
-                        strokeWidth = 2f
-                    )
-
-                    // 2. Yellow dynamic rotatable indicator corresponding to actual physical pitch & roll
-                    // Rolled tilt calculation
-                    val rollRad = Math.toRadians(currentRoll.toDouble()).toFloat()
-                    val deltaYPitch = currentPitch * 2.5f // pitch translational scaling offset
-
-                    val length = 40f
-                    val gap = 40f
-
-                    // Rotate level lines according to tilt
-                    val cosR = cos(rollRad)
-                    val sinR = sin(rollRad)
-
-                    val leftLineStartX = cx - (gap + length) * cosR + deltaYPitch * sinR
-                    val leftLineStartY = cy - (gap + length) * sinR - deltaYPitch * cosR
-                    val leftLineEndX = cx - gap * cosR + deltaYPitch * sinR
-                    val leftLineEndY = cy - gap * sinR - deltaYPitch * cosR
-
-                    val rightLineStartX = cx + gap * cosR + deltaYPitch * sinR
-                    val rightLineStartY = cy + gap * sinR - deltaYPitch * cosR
-                    val rightLineEndX = cx + (gap + length) * cosR + deltaYPitch * sinR
-                    val rightLineEndY = cy + (gap + length) * sinR - deltaYPitch * cosR
-
-                    val isLeveled = abs(currentRoll) < 1.0f && abs(currentPitch) < 1.0f
-                    val levelColor = if (isLeveled) Color(0xFF34A853) else Color(0xFFFBB03B)
-
-                    // Draw yellow (or green) gravity gauges
-                    drawLine(
-                        color = levelColor,
-                        start = Offset(leftLineStartX, leftLineStartY),
-                        end = Offset(leftLineEndX, leftLineEndY),
-                        strokeWidth = 2.5f
-                    )
-                    drawLine(
-                        color = levelColor,
-                        start = Offset(rightLineStartX, rightLineStartY),
-                        end = Offset(rightLineEndX, rightLineEndY),
-                        strokeWidth = 2.5f
-                    )
-                }
-
-                // Real-time Guidance Direction Text Badge Pill!
-                val closestTarget = nodes.filter { !it.captured }.minByOrNull { node ->
-                    var dy = node.targetYaw - currentYaw
-                    while (dy > 180f) dy -= 360f
-                    while (dy < -180f) dy += 360f
-                    val dp = node.targetPitch - currentPitch
-                    dy * dy + dp * dp
-                }
-
-                closestTarget?.let { node ->
-                    var dy = node.targetYaw - currentYaw
-                    while (dy > 180f) dy -= 360f
-                    while (dy < -180f) dy += 360f
-                    val dp = node.targetPitch - currentPitch
-
-                    val dist = sqrt(dy*dy + dp*dp)
-                    if (dist > 1.8f) {
-                        val dirText = StringBuilder()
-                        if (abs(dy) > 1.8f) {
-                            dirText.append(if (dy > 0f) "PAN RIGHT ${dy.toInt()}°" else "PAN LEFT ${abs(dy).toInt()}°")
-                        }
-                        if (abs(dp) > 1.8f) {
-                            if (abs(dy) > 1.8f) dirText.append(" & ")
-                            dirText.append(if (dp > 0f) "TILT UP ${dp.toInt()}°" else "TILT DOWN ${abs(dp).toInt()}°")
-                        }
-
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E212A).copy(alpha = 0.85f)),
-                            shape = RoundedCornerShape(20.dp),
-                            border = BorderStroke(1.dp, Color(0xFF4285F4).copy(alpha = 0.5f))
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    Icons.Default.Navigation,
-                                    contentDescription = "Arrow Guide Indicator",
-                                    tint = Color(0xFF4285F4),
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Text(
-                                    text = dirText.toString(),
-                                    color = Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold,
-                                    letterSpacing = 0.4.sp
-                                )
-                            }
-                        }
-                    } else {
-                        // Perfectly Aligned pill!
-                        Card(
-                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3D2A)),
-                            shape = RoundedCornerShape(20.dp)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
-                                horizontalArrangement = Arrangement.spacedBy(6.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(
-                                    Icons.Default.CheckCircle,
-                                    contentDescription = "Hold still",
-                                    tint = Color(0xFF34A853),
-                                    modifier = Modifier.size(14.dp)
-                                )
-                                Text(
-                                    text = "HOLD STILL - ALIGNED!",
-                                    color = Color.White,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                        }
+                    if (totalCaptured == 0) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .background(Color(0xFF4285F4), CircleShape)
+                        )
                     }
+                    Text(
+                        text = textGuide,
+                        color = Color.White,
+                        fontSize = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 0.2.sp
+                    )
                 }
             }
         }
 
-        // --- CAMERA SHUTTER BLINK FADE COMPOSABLE ---
+        // --- 5. CAMERA SHUTTER BLINK FADE OVERLAY ---
         if (activeNodeIdInBurst != null) {
             val flashAlpha = (1f - activeBurstProgress).coerceIn(0f, 1f)
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .background(Color.White.copy(alpha = flashAlpha * 0.6f))
+                    .background(Color.White.copy(alpha = flashAlpha * 0.55f))
             )
         }
 
-        // --- ACTIVE HDR+ CAPTURING PROGRESS INDICATOR ---
-        // Rapid radial progress bar shown immediately over the screen center while capturing a node
+        // --- 6. FLOATING HUD RECONSTRUCTION RADIAL DIALOG ---
         if (activeNodeIdInBurst != null) {
             Box(
                 modifier = Modifier.fillMaxSize(),
                 contentAlignment = Alignment.Center
             ) {
                 Card(
-                    colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.85f)),
-                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.88f)),
+                    shape = RoundedCornerShape(16.dp),
                     border = BorderStroke(1.dp, Color(0xFF4285F4)),
-                    modifier = Modifier.size(160.dp)
+                    modifier = Modifier.size(150.dp)
                 ) {
                     Column(
                         modifier = Modifier.fillMaxSize(),
@@ -1286,18 +1261,18 @@ fun CaptureScreen(
                         CircularProgressIndicator(
                             progress = { activeBurstProgress },
                             color = Color(0xFF4285F4),
-                            strokeWidth = 5.dp,
-                            modifier = Modifier.size(54.dp)
+                            strokeWidth = 4.dp,
+                            modifier = Modifier.size(48.dp)
                         )
                         Spacer(modifier = Modifier.height(14.dp))
-                        Text("HDR+ FUSING...", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                        Text("Compand raw exposures", color = Color.Gray, fontSize = 9.sp)
+                        Text("HDR+ SHIFT FUSING...", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                        Text("Linear composite exposures", color = Color.Gray, fontSize = 8.sp)
                     }
                 }
             }
         }
 
-        // --- VIEWFINDER CONFIGURABLE PREFERENCES OVERLAY ---
+        // --- 7. CONFIGURABLE PREFERENCES OVERLAY DRAWER ---
         AnimatedVisibility(
             visible = isSettingsOverlayOpen,
             enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
@@ -1305,19 +1280,19 @@ fun CaptureScreen(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.TopCenter)
-                .padding(top = 74.dp, start = 14.dp, end = 14.dp)
+                .padding(top = 68.dp, start = 14.dp, end = 14.dp)
         ) {
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color(0xFF16181E).copy(alpha = 0.96f)),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF13151D).copy(alpha = 0.96f)),
                 shape = RoundedCornerShape(16.dp),
-                border = BorderStroke(1.dp, Color(0xFF4285F4).copy(alpha = 0.45f)),
+                border = BorderStroke(1.dp, Color(0xFF4285F4).copy(alpha = 0.5f)),
                 modifier = Modifier
                     .fillMaxWidth()
                     .testTag("preferences_drawer_card")
             ) {
                 Column(
                     modifier = Modifier.padding(16.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1325,7 +1300,7 @@ fun CaptureScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "GCAM VIEWFINDER SETTINGS",
+                            text = "GCAM VIEWFINDER PREFERENCES",
                             style = MaterialTheme.typography.titleSmall.copy(
                                 fontWeight = FontWeight.Bold,
                                 color = Color(0xFF4285F4),
@@ -1349,7 +1324,7 @@ fun CaptureScreen(
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
-                            Text("Auto Overlap Shutter", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Auto Overlap Snap", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                             Text("Snaps automatically on zero-drift align", color = Color.Gray, fontSize = 9.sp)
                         }
                         Switch(
@@ -1360,14 +1335,14 @@ fun CaptureScreen(
                         )
                     }
 
-                    // 2. HDR+ Burst Strength (Dropdown selector)
+                    // 2. HDR+ Burst Strength
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1.2f)) {
-                            Text("HDR+ Burst Strength", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            Text("Linear exposure stack frames", color = Color.Gray, fontSize = 9.sp)
+                            Text("HDR+ Burst Frames", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Exposure index level integration", color = Color.Gray, fontSize = 9.sp)
                         }
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -1391,14 +1366,14 @@ fun CaptureScreen(
                         }
                     }
 
-                    // 3. Audio trigger selection sound dropdown
+                    // 3. Audio Trigger selector
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1.2f)) {
-                            Text("Capture Sound Effect", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            Text("Viewfinder click tone style", color = Color.Gray, fontSize = 9.sp)
+                            Text("Capture Click FX", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Shutter audible audio", color = Color.Gray, fontSize = 9.sp)
                         }
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -1427,14 +1402,14 @@ fun CaptureScreen(
                         }
                     }
 
-                    // 4. Vibration selector haptic strength
+                    // 4. Vibration Haptic
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Column(modifier = Modifier.weight(1.2f)) {
-                            Text("Tactile Vibration", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
-                            Text("Aligned confirmation pulse", color = Color.Gray, fontSize = 9.sp)
+                            Text("Haptic Feedback", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Confirmation tactile snap", color = Color.Gray, fontSize = 9.sp)
                         }
                         Row(
                             horizontalArrangement = Arrangement.spacedBy(4.dp),
@@ -1463,7 +1438,6 @@ fun CaptureScreen(
                         }
                     }
 
-                    // 5. Space Noise Reduction Slider
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Noise Reduc:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(76.dp))
                         Slider(
@@ -1475,7 +1449,6 @@ fun CaptureScreen(
                         Text("${noiseReductionPower.toInt()}%", color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.width(32.dp), textAlign = TextAlign.End)
                     }
 
-                    // 6. Detail Sharpness Slider
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text("Detail Boost:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(76.dp))
                         Slider(
@@ -1486,60 +1459,60 @@ fun CaptureScreen(
                         )
                         Text("${detailEnhancementPower.toInt()}%", color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.width(32.dp), textAlign = TextAlign.End)
                     }
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    // Reset captured grid action inside settings drawers!
+                    Button(
+                        onClick = {
+                            onResetCapture()
+                            isSettingsOverlayOpen = false
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFC62828)),
+                        shape = RoundedCornerShape(8.dp),
+                        modifier = Modifier.fillMaxWidth().height(32.dp)
+                    ) {
+                        Icon(Icons.Default.Refresh, contentDescription = "Reset Grid", modifier = Modifier.size(14.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("RESET SPHERE CAPTURE GRID", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    }
                 }
             }
         }
 
-        // --- HUD HEADER CONTROLS ---
+        // --- 8. HUD MINI FLOATING HEADER UTILITIES ---
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(14.dp),
+                .padding(top = 18.dp, start = 14.dp, end = 14.dp),
             horizontalArrangement = Arrangement.SpaceBetween,
             verticalAlignment = Alignment.CenterVertically
         ) {
-            IconButton(
-                onClick = onBack,
-                modifier = Modifier
-                    .background(Color.Black.copy(alpha = 0.6f), CircleShape)
-                    .testTag("capture_back_button")
-            ) {
-                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Return", tint = Color.White)
-            }
-
-            // Real-time tracking specs dashboard
+            // Little indicator badge
             Card(
-                colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.7f)),
-                shape = RoundedCornerShape(12.dp),
-                border = BorderStroke(1.dp, Color(0xFF2B2B30))
+                colors = CardDefaults.cardColors(containerColor = Color.Black.copy(alpha = 0.55f)),
+                shape = RoundedCornerShape(8.dp)
             ) {
-                Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp)) {
-                    Row(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(8.dp)
-                                .clip(CircleShape)
-                                .background(if (isSensorActive && !isManualSwipeMode) Color(0xFF34A853) else Color(0xFFFFB74D))
-                        )
-                        Text(
-                            text = if (isSensorActive && !isManualSwipeMode) "Quaternion Fusion Active" else "Manual Gyro Panning",
-                            color = Color.White,
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
+                Row(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(6.dp)
+                            .background(if (isSensorActive && !isManualSwipeMode) Color(0xFF34A853) else Color(0xFFFFB74D), CircleShape)
+                    )
                     Text(
-                        text = "Yaw: ${String.format("%.1f", currentYaw)}° | Pitch: ${String.format("%.1f", currentPitch)}°",
-                        color = Color.Gray,
+                        text = "Y: ${String.format("%.0f", currentYaw)}° P: ${String.format("%.0f", currentPitch)}°",
+                        color = Color.White,
                         fontSize = 10.sp,
                         fontFamily = FontFamily.Monospace
                     )
                 }
             }
 
+            // Quick utility buttons
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -1547,147 +1520,146 @@ fun CaptureScreen(
                 IconButton(
                     onClick = onToggleManualSwipe,
                     modifier = Modifier
-                        .background(if (isManualSwipeMode) Color(0xFF4285F4) else Color.Black.copy(alpha = 0.6f), CircleShape)
+                        .size(36.dp)
+                        .background(if (isManualSwipeMode) Color(0xFF4285F4) else Color.Black.copy(alpha = 0.55f), CircleShape)
                 ) {
-                    Icon(Icons.Default.Swipe, contentDescription = "Manual Swipe Emulator", tint = Color.White)
+                    Icon(Icons.Default.Swipe, contentDescription = "Manual Swipe Emulator", tint = Color.White, modifier = Modifier.size(16.dp))
                 }
 
                 IconButton(
                     onClick = { isSettingsOverlayOpen = !isSettingsOverlayOpen },
                     modifier = Modifier
-                        .background(if (isSettingsOverlayOpen) Color(0xFF4285F4) else Color.Black.copy(alpha = 0.6f), CircleShape)
+                        .size(36.dp)
+                        .background(if (isSettingsOverlayOpen) Color(0xFF4285F4) else Color.Black.copy(alpha = 0.55f), CircleShape)
                         .testTag("viewfinder_settings_toggle")
                 ) {
-                    Icon(Icons.Default.Settings, contentDescription = "System Preferences", tint = Color.White)
+                    Icon(Icons.Default.Settings, contentDescription = "Settings preferences", tint = Color.White, modifier = Modifier.size(16.dp))
                 }
             }
         }
 
-        // --- HUD BOTTOM BAR ACTIONS AND STEPS ---
+        // --- 9. CENTRAL TIMED MANUAL OVERRIDE ALIGNMENT SNAPPERS ---
+        // Helpful button float right above bottom console to easily trigger capture manually on clicked
+        val nextTargetNode = nodes.firstOrNull { node ->
+            if (node.captured) return@firstOrNull false
+            var diffYaw = node.targetYaw - currentYaw
+            while (diffYaw > 180f) diffYaw -= 360f
+            while (diffYaw < -180f) diffYaw += 360f
+            val diffPitch = node.targetPitch - currentPitch
+            abs(diffYaw) < 1.8f && abs(diffPitch) < 1.8f
+        }
+
+        // Auto Capture effect watcher
+        LaunchedEffect(nextTargetNode) {
+            if (nextTargetNode != null && autoCaptureEnabled && activeNodeIdInBurst == null) {
+                onTriggerBurstCapture(nextTargetNode)
+            }
+        }
+
+        if (nextTargetNode == null && totalCaptured < nodes.size) {
+            Button(
+                onClick = {
+                    val closest = nodes.filter { !it.captured }.minByOrNull {
+                        var dy = it.targetYaw - currentYaw
+                        while (dy > 180f) dy -= 360f
+                        while (dy < -180f) dy += 360f
+                        dy * dy + (it.targetPitch - currentPitch) * (it.targetPitch - currentPitch)
+                    }
+                    closest?.let { onTriggerBurstCapture(it) }
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEA4335).copy(alpha = 0.85f)),
+                shape = RoundedCornerShape(20.dp),
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.25f)),
+                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 120.dp)
+                    .testTag("manual_shutter_btn")
+            ) {
+                Icon(Icons.Default.Camera, contentDescription = "Snap Align", modifier = Modifier.size(14.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Force Lock Current Sector", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+
+        // --- 10. GCAM CLASSIC THREE-BUTTON BOTTOM BAR CONSOLE ---
+        // Complete solid dark bar featuring Revert, green double check, and cancel exit
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .align(Alignment.BottomCenter)
-                .background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.9f))))
-                .padding(bottom = 20.dp, top = 20.dp)
+                .background(Color(0xFF1E1F24))
+                .padding(vertical = 24.dp)
         ) {
-            Column(
-                modifier = Modifier.fillMaxWidth(),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
-                horizontalAlignment = Alignment.CenterHorizontally
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 40.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                // Visual slider progress mapping nodes captured
-                Row(
+                // Far Left: Undo / Revert Last Capture button
+                IconButton(
+                    onClick = onUndoLastCapture,
+                    enabled = totalCaptured > 0,
                     modifier = Modifier
-                        .fillMaxWidth(0.85f),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                        .size(54.dp)
+                        .background(
+                            if (totalCaptured > 0) Color(0xFF2F3035) else Color(0x222F3035),
+                            CircleShape
+                        )
+                        .testTag("capture_undo_button")
                 ) {
-                    Text(
-                        text = "MOSAIC STATUS: $totalCaptured / ${nodes.size} SECTOR SAMPLES",
-                        color = Color.LightGray,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
-                    )
-                    Text(
-                        text = "${(totalProgress * 100).toInt()}%",
-                        color = Color(0xFF4285F4),
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold
+                    Icon(
+                        imageVector = Icons.Default.Undo,
+                        contentDescription = "Undo Last Captured Node",
+                        tint = if (totalCaptured > 0) Color.White else Color.Gray,
+                        modifier = Modifier.size(22.dp)
                     )
                 }
 
-                LinearProgressIndicator(
-                    progress = { totalProgress },
-                    color = Color(0xFF4285F4),
-                    trackColor = Color(0xFF262A35),
+                // Middle: Stitch and Done Checkmark button inside white-outlined circular ring
+                Box(
                     modifier = Modifier
-                        .fillMaxWidth(0.85f)
-                        .height(6.dp)
-                        .clip(CircleShape)
-                )
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(0.85f),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                        .size(72.dp)
+                        .background(Color.Transparent, CircleShape)
+                        .border(4.dp, Color.White, CircleShape),
+                    contentAlignment = Alignment.Center
                 ) {
-                    // Reset Button
-                    OutlinedButton(
-                        onClick = onResetCapture,
-                        border = BorderStroke(1.dp, Color.Gray.copy(alpha = 0.5f)),
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                        modifier = Modifier.testTag("reset_capture_btn")
-                    ) {
-                        Icon(Icons.Default.Refresh, contentDescription = "Reset Icon", modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Reset Grid", fontSize = 11.sp, color = Color.White)
-                    }
-
-                    // Simulated / physical trigger trigger helper
-                    val nextTargetNode = nodes.firstOrNull { node ->
-                        if (node.captured) return@firstOrNull false
-                        
-                        var diffYaw = node.targetYaw - currentYaw
-                        while (diffYaw > 180f) diffYaw -= 360f
-                        while (diffYaw < -180f) diffYaw += 360f
-
-                        val diffPitch = node.targetPitch - currentPitch
-                        abs(diffYaw) < 1.8f && abs(diffPitch) < 1.8f
-                    }
-
-                    // Auto Capture trigger detector effect
-                    LaunchedEffect(nextTargetNode) {
-                        if (nextTargetNode != null && autoCaptureEnabled && activeNodeIdInBurst == null) {
-                            onTriggerBurstCapture(nextTargetNode)
-                        }
-                    }
-
-                    Button(
-                        onClick = {
-                            if (nextTargetNode != null) {
-                                onTriggerBurstCapture(nextTargetNode)
-                            } else {
-                                // Manual override snapshot target closest
-                                val closest = nodes.filter { !it.captured }.minByOrNull {
-                                    var diffYaw = it.targetYaw - currentYaw
-                                    while (diffYaw > 180f) diffYaw -= 360f
-                                    while (diffYaw < -180f) diffYaw += 360f
-                                    diffYaw * diffYaw + (it.targetPitch - currentPitch) * (it.targetPitch - currentPitch)
-                                }
-                                closest?.let { onTriggerBurstCapture(it) }
-                            }
-                        },
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = if (nextTargetNode != null) Color(0xFF34A853) else Color(0xFFD32F2F)
-                        ),
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                        modifier = Modifier.testTag("manual_shutter_btn")
-                    ) {
-                        Icon(Icons.Default.Camera, contentDescription = "Manual Shutter", modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = if (nextTargetNode != null) "Lock Target Node" else "Force Snap Close",
-                            fontSize = 11.sp,
-                            fontWeight = FontWeight.Bold
-                        )
-                    }
-
-                    // Process / Stitch Launch Button
-                    Button(
+                    IconButton(
                         onClick = onStartStitching,
                         enabled = totalCaptured > 0,
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4285F4)),
-                        shape = RoundedCornerShape(10.dp),
-                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp),
-                        modifier = Modifier.testTag("stitch_now_btn")
+                        modifier = Modifier
+                            .size(56.dp)
+                            .background(
+                                if (totalCaptured > 0) Color(0xFF34A853) else Color(0x3334A853),
+                                CircleShape
+                            )
+                            .testTag("stitch_now_btn")
                     ) {
-                        Icon(Icons.Default.Splitscreen, contentDescription = "Stitch Icon", modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text("Stitch Pano", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Icon(
+                            imageVector = Icons.Default.Check,
+                            contentDescription = "Confirm Stitching",
+                            tint = if (totalCaptured > 0) Color.White else Color.White.copy(alpha = 0.35f),
+                            modifier = Modifier.size(28.dp)
+                        )
                     }
+                }
+
+                // Far Right: Exit / Cancel button
+                IconButton(
+                    onClick = onBack,
+                    modifier = Modifier
+                        .size(54.dp)
+                        .background(Color(0xFF2F3035), CircleShape)
+                        .testTag("capture_close_button")
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Close,
+                        contentDescription = "Exit Capture",
+                        tint = Color.White,
+                        modifier = Modifier.size(22.dp)
+                    )
                 }
             }
         }

@@ -131,8 +131,17 @@ class SensorFusionTracker(context: Context) : SensorEventListener {
             // Get rotation matrix
             SensorManager.getRotationMatrixFromVector(rotationMatrix, event.values)
             
-            // Get Euler angles
-            SensorManager.getOrientation(rotationMatrix, orientationAngles)
+            // Remap for landscape/portrait camera viewport
+            val remappedMatrix = FloatArray(9)
+            SensorManager.remapCoordinateSystem(
+                rotationMatrix,
+                SensorManager.AXIS_X,
+                SensorManager.AXIS_Z,
+                remappedMatrix
+            )
+
+            // Get Euler angles from the remapped matrix
+            SensorManager.getOrientation(remappedMatrix, orientationAngles)
 
             // Convert and update
             val radYaw = orientationAngles[0]
@@ -140,7 +149,8 @@ class SensorFusionTracker(context: Context) : SensorEventListener {
             val radRoll = orientationAngles[2]
 
             _yaw.value = Math.toDegrees(radYaw.toDouble()).toFloat()
-            _pitch.value = Math.toDegrees(radPitch.toDouble()).toFloat()
+            // Invert pitch dynamically so tilting up increases pitch values consistently
+            _pitch.value = -Math.toDegrees(radPitch.toDouble()).toFloat()
             _roll.value = Math.toDegrees(radRoll.toDouble()).toFloat()
 
             // Construct quaternion from rotation vector
@@ -178,9 +188,16 @@ class SensorFusionTracker(context: Context) : SensorEventListener {
 
             val success = SensorManager.getRotationMatrix(rotationMatrix, null, accelVals, magVals)
             if (success) {
-                SensorManager.getOrientation(rotationMatrix, orientationAngles)
+                val remappedMatrix = FloatArray(9)
+                SensorManager.remapCoordinateSystem(
+                    rotationMatrix,
+                    SensorManager.AXIS_X,
+                    SensorManager.AXIS_Z,
+                    remappedMatrix
+                )
+                SensorManager.getOrientation(remappedMatrix, orientationAngles)
                 _yaw.value = Math.toDegrees(orientationAngles[0].toDouble()).toFloat()
-                _pitch.value = Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
+                _pitch.value = -Math.toDegrees(orientationAngles[1].toDouble()).toFloat()
                 _roll.value = Math.toDegrees(orientationAngles[2].toDouble()).toFloat()
 
                 // Extract quaternion from rotation matrix
