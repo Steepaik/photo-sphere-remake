@@ -1,5 +1,6 @@
 package com.example.model
 
+import android.graphics.Bitmap
 import kotlin.math.cos
 import kotlin.math.sin
 
@@ -10,7 +11,8 @@ data class PhotoSphereNode(
     val captured: Boolean = false,
     val capturedProgress: Float = 0f, // 0 to 1 for HDR+ burst capture progress
     val thumbnailId: Int? = null,
-    val elevationBand: ElevationBand
+    val elevationBand: ElevationBand,
+    val capturedBitmap: Bitmap? = null // Real captured image preview bitmap
 ) {
     enum class ElevationBand {
         ZENITH,

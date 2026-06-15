@@ -141,13 +141,40 @@ class StitchingPipeline {
         paint.style = Paint.Style.FILL
 
         nodes.forEach { node ->
-            if (!node.captured) {
-                // Map the spherical (yaw, pitch) coordinate to equirectangular coordinates (x, y)
-                // targetYaw: [-180, 180] -> x: [0, width]
-                // targetPitch: [-90, 90] -> y: [height, 0] (height maps to -90, 0 maps to 90)
-                val x = ((node.targetYaw + 180f) / 360f) * width
-                val y = ((90f - node.targetPitch) / 180f) * height
-                
+            val x = ((node.targetYaw + 180f) / 360f) * width
+            val y = ((90f - node.targetPitch) / 180f) * height
+
+            if (node.captured) {
+                node.capturedBitmap?.let { bmp ->
+                    val sectorWidth = 345f
+                    val sectorHeight = 258f // Landscape 4:3 sector span
+
+                    val saveCount = canvas.save()
+                    val clipPath = Path()
+                    // Apply smooth rounded edges to each captured patch for a feathered, seam-blended transition look
+                    clipPath.addRoundRect(
+                        x - sectorWidth / 2f,
+                        y - sectorHeight / 2f,
+                        x + sectorWidth / 2f,
+                        y + sectorHeight / 2f,
+                        20f,
+                        20f,
+                        Path.Direction.CW
+                    )
+                    canvas.clipPath(clipPath)
+
+                    val srcRect = android.graphics.Rect(0, 0, bmp.width, bmp.height)
+                    val dstRect = android.graphics.RectF(
+                        x - sectorWidth / 2f,
+                        y - sectorHeight / 2f,
+                        x + sectorWidth / 2f,
+                        y + sectorHeight / 2f
+                    )
+                    // Stamp the real captured cell frame onto our sphere projection coordinate
+                    canvas.drawBitmap(bmp, srcRect, dstRect, paint)
+                    canvas.restoreToCount(saveCount)
+                }
+            } else {
                 // Draw a dark uncaptured sector placeholder
                 paint.color = Color.argb(230, 12, 12, 16)
                 canvas.drawCircle(x, y, 75f, paint)

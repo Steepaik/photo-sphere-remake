@@ -14,12 +14,19 @@ import android.media.ToneGenerator
 import android.os.Build
 import android.os.Vibrator
 import android.util.Log
+import android.graphics.BitmapFactory
+import java.nio.ByteBuffer
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.Preview as CameraPreview
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.ImageProxy
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.animation.*
 import androidx.compose.foundation.*
 import androidx.compose.foundation.gestures.detectDragGestures
@@ -135,6 +142,7 @@ fun PhotoSphereApp() {
             ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
         )
     }
+    var takePhotoAction by remember { mutableStateOf<((onPhotoCaptured: (Bitmap) -> Unit) -> Unit)?>(null) }
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = { granted -> hasCameraPermission = granted }
@@ -315,12 +323,48 @@ fun PhotoSphereApp() {
                                 playShutterSoundCombined(context, captureSoundEffect)
                                 playHapticVibe(context, vibrationPower)
                                 activeNodeIdInBurst = node.id
+                                
+                                var capturedBmp: Bitmap? = null
+                                // Attempt real ImageCapture via registered CameraX session
+                                if (!isManualSwipeMode && takePhotoAction != null) {
+                                    val deferred = kotlinx.coroutines.CompletableDeferred<Bitmap>()
+                                    takePhotoAction?.invoke { bmp ->
+                                        deferred.complete(bmp)
+                                    }
+                                    try {
+                                        capturedBmp = kotlinx.coroutines.withTimeoutOrNull(3000) {
+                                            deferred.await()
+                                        }
+                                    } catch (e: Exception) {
+                                        Log.e("PhotoSphereApp", "Real camera frame grab failed, utilizing fallback", e)
+                                    }
+                                }
+
+                                // Fallback to realistic orientation-aware procedural render
+                                if (capturedBmp == null) {
+                                    capturedBmp = generateSimulatedPhotoAtState(
+                                        yaw = node.targetYaw,
+                                        pitch = node.targetPitch,
+                                        lensName = selectedLens
+                                    )
+                                }
+
+                                // Simulated HDR+ stack merging process
                                 for (prog in 1..10) {
-                                    delayLonger(75)
+                                    delayLonger(40)
                                     activeBurstProgress = prog / 10f
                                 }
+
                                 nodesList = nodesList.map {
-                                    if (it.id == node.id) it.copy(captured = true, capturedProgress = 1f) else it
+                                    if (it.id == node.id) {
+                                        it.copy(
+                                            captured = true,
+                                            capturedProgress = 1f,
+                                            capturedBitmap = capturedBmp
+                                        )
+                                    } else {
+                                        it
+                                    }
                                 }
                                 activeNodeIdInBurst = null
                                 activeBurstProgress = 0f
@@ -375,9 +419,12 @@ fun PhotoSphereApp() {
                             val lastCaptured = nodesList.filter { it.captured }.lastOrNull()
                             if (lastCaptured != null) {
                                 nodesList = nodesList.map {
-                                    if (it.id == lastCaptured.id) it.copy(captured = false, capturedProgress = 0f) else it
+                                    if (it.id == lastCaptured.id) it.copy(captured = false, capturedProgress = 0f, capturedBitmap = null) else it
                                 }
                             }
+                        },
+                        onImageCaptureRegistered = { action ->
+                            takePhotoAction = action
                         }
                     )
                 }
@@ -864,19 +911,24 @@ fun project3DPoint(
     height: Float,
     focalScale: Float
 ): Offset? {
+    // Negate the angles to perform the inverse Camera Transform matrix (World -> Camera Space conversion)
+    val yaw = -cyRad
+    val pitch = -cpRad
+    val roll = -crRad
+
     // 1. Rotate around vertical Y center (yaw angle)
-    val x1 = worldX * cos(cyRad) + worldZ * sin(cyRad)
+    val x1 = worldX * cos(yaw) + worldZ * sin(yaw)
     val y1 = worldY
-    val z1 = -worldX * sin(cyRad) + worldZ * cos(cyRad)
+    val z1 = -worldX * sin(yaw) + worldZ * cos(yaw)
 
     // 2. Rotate around horizontal X center (pitch angle)
     val x2 = x1
-    val y2 = y1 * cos(cpRad) + z1 * sin(cpRad)
-    val z2 = -y1 * sin(cpRad) + z1 * cos(cpRad)
+    val y2 = y1 * cos(pitch) + z1 * sin(pitch)
+    val z2 = -y1 * sin(pitch) + z1 * cos(pitch)
 
     // 3. Rotate around Z axis (roll angle) - stabilizing screen coordinates against device roll
-    val x3 = x2 * cos(crRad) + y2 * sin(crRad)
-    val y3 = -x2 * sin(crRad) + y2 * cos(crRad)
+    val x3 = x2 * cos(roll) + y2 * sin(roll)
+    val y3 = -x2 * sin(roll) + y2 * cos(roll)
     val z3 = z2
 
     if (z3 > 0.05f) {
@@ -925,7 +977,8 @@ fun CaptureScreen(
     onResetCapture: () -> Unit,
     onStartStitching: () -> Unit,
     onBack: () -> Unit,
-    onUndoLastCapture: () -> Unit
+    onUndoLastCapture: () -> Unit,
+    onImageCaptureRegistered: (((onPhotoCaptured: (Bitmap) -> Unit) -> Unit) -> Unit)? = null
 ) {
     val context = LocalContext.current
     val density = LocalDensity.current.density
@@ -1053,7 +1106,10 @@ fun CaptureScreen(
                 .testTag("centered_camera_viewport")
         ) {
             if (!isManualSwipeMode && ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-                CameraXPreviewView(modifier = Modifier.fillMaxSize())
+                CameraXPreviewView(
+                    modifier = Modifier.fillMaxSize(),
+                    onImageCaptureRegistered = onImageCaptureRegistered
+                )
             } else {
                 Box(
                     modifier = Modifier
@@ -1165,37 +1221,57 @@ fun CaptureScreen(
                     val diffPitch = node.targetPitch - currentPitch
 
                     if (node.captured) {
-                        // Floating Captured Image Frame in Air
-                        val cardW = 120.dp.toPx()
-                        val cardH = 180.dp.toPx()
+                        // Floating Captured Image Frame in Air with 3D Depth Scaling
+                        val yawTemp = -cyRad
+                        val pitchTemp = -cpRad
+                        val x1_z = nx * cos(yawTemp) + nz * sin(yawTemp)
+                        val z1_z = -nx * sin(yawTemp) + nz * cos(yawTemp)
+                        val z3 = (-ny * sin(pitchTemp) + z1_z * cos(pitchTemp)).coerceAtLeast(0.1f)
 
+                        val depthScale = (1.0f / z3).coerceIn(0.4f, 2.2f)
+                        val cardW = 140.dp.toPx() * depthScale
+                        val cardH = 105.dp.toPx() * depthScale
+
+                        if (node.capturedBitmap != null) {
+                            drawImage(
+                                image = node.capturedBitmap.asImageBitmap(),
+                                dstOffset = IntOffset((px - cardW / 2f).toInt(), (py - cardH / 2f).toInt()),
+                                dstSize = IntSize(cardW.toInt(), cardH.toInt()),
+                                alpha = 0.88f
+                            )
+                        } else {
+                            drawRect(
+                                color = Color(0xFF1E212A).copy(alpha = 0.38f),
+                                topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
+                                size = Size(cardW, cardH)
+                            )
+                        }
+
+                        // Floating outer white border
                         drawRect(
-                            color = Color(0xFF1E212A).copy(alpha = 0.28f),
-                            topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
-                            size = Size(cardW, cardH)
-                        )
-                        drawRect(
-                            color = Color.White.copy(alpha = 0.45f),
+                            color = Color.White.copy(alpha = 0.55f),
                             topLeft = Offset(px - cardW / 2f, py - cardH / 2f),
                             size = Size(cardW, cardH),
-                            style = Stroke(width = 1.5.dp.toPx())
+                            style = Stroke(width = 1.8.dp.toPx() * depthScale)
                         )
+
+                        // Draw a stylish completion badge
                         drawCircle(
                             color = Color(0xFF34A853),
-                            radius = 9.dp.toPx(),
+                            radius = 10.dp.toPx() * depthScale,
                             center = Offset(px, py)
                         )
                         drawLine(
                             color = Color.White,
-                            start = Offset(px - 4.dp.toPx(), py),
-                            end = Offset(px - 1.dp.toPx(), py + 3.dp.toPx()),
-                            strokeWidth = 2.dp.toPx()
+                            start = Offset(px - 4.dp.toPx() * depthScale, py),
+                            end = Offset(px - 1.dp.toPx() * depthScale, py + 3.dp.toPx() * depthScale),
+                            strokeWidth = 2.dp.toPx() * depthScale
                         )
                         drawLine(
                             color = Color.White,
-                            start = Offset(px - 1.dp.toPx(), py + 3.dp.toPx()),
-                            end = Offset(px + 4.dp.toPx(), py - 3.dp.toPx()),
-                            strokeWidth = 2.dp.toPx()
+                            start = Offset(px - 1.dp.toPx() * depthScale, py + 3.dp.toPx() * depthScale),
+                            end = Offset(px + 4.dp.toPx() * depthScale, py - 3.dp.toPx() * depthScale),
+                            strokeWidth = 2.dp.toPx() * depthScale
                         )
                     } else {
                         // Guide point circle target
@@ -1810,11 +1886,37 @@ fun CaptureScreen(
 }
 
 @Composable
-fun CameraXPreviewView(modifier: Modifier = Modifier) {
+fun CameraXPreviewView(
+    modifier: Modifier = Modifier,
+    onImageCaptureRegistered: (((onPhotoCaptured: (Bitmap) -> Unit) -> Unit) -> Unit)? = null
+) {
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
 
     val previewView = remember { PreviewView(context) }
+    val imageCapture = remember { ImageCapture.Builder().build() }
+
+    LaunchedEffect(imageCapture) {
+        onImageCaptureRegistered?.invoke { onPhotoCaptured ->
+            val executor = ContextCompat.getMainExecutor(context)
+            imageCapture.takePicture(executor, object : ImageCapture.OnImageCapturedCallback() {
+                override fun onCaptureSuccess(image: ImageProxy) {
+                    try {
+                        val bitmap = image.toBitmap()
+                        onPhotoCaptured(bitmap)
+                    } catch (e: Exception) {
+                        Log.e("CameraX", "Failed to convert ImageProxy to Bitmap", e)
+                    } finally {
+                        image.close()
+                    }
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    Log.e("CameraX", "Failed to capture image", exception)
+                }
+            })
+        }
+    }
 
     LaunchedEffect(Unit) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
@@ -1829,7 +1931,8 @@ fun CameraXPreviewView(modifier: Modifier = Modifier) {
                 cameraProvider.bindToLifecycle(
                     lifecycleOwner,
                     CameraSelector.DEFAULT_BACK_CAMERA,
-                    preview
+                    preview,
+                    imageCapture
                 )
             } catch (e: Exception) {
                 Log.e("CameraXPreview", "Lifecycle binding failed", e)
@@ -1841,6 +1944,147 @@ fun CameraXPreviewView(modifier: Modifier = Modifier) {
         factory = { previewView },
         modifier = modifier
     )
+}
+
+// Helper to convert CameraX ImageProxy back to standard Android Bitmap
+fun ImageProxy.toBitmap(): Bitmap {
+    val buffer = planes[0].buffer
+    val bytes = ByteArray(buffer.remaining())
+    buffer.get(bytes)
+    val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    if (bitmap == null) {
+        return Bitmap.createBitmap(640, 480, Bitmap.Config.ARGB_8888)
+    }
+    if (imageInfo.rotationDegrees != 0) {
+        val matrix = android.graphics.Matrix()
+        matrix.postRotate(imageInfo.rotationDegrees.toFloat())
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+    return bitmap
+}
+
+// Generate highly detailed orientation-specific landscape/sky view to simulate real capture in simulation/fallback
+fun generateSimulatedPhotoAtState(
+    yaw: Float,
+    pitch: Float,
+    lensName: String
+): Bitmap {
+    val w = 640
+    val h = 480
+    val bitmap = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(bitmap)
+    val paint = android.graphics.Paint()
+
+    // Create a beautiful sky gradient mapped to vertical pitch
+    // Tilting up shows darker blue skies, tilting down shows warmer sunset colors on the horizon
+    val normalizedPitch = ((pitch + 90f) / 180f).coerceIn(0f, 1f)
+    val skyColors = intArrayOf(
+        android.graphics.Color.rgb(10, 15, 38),   // Zenith Space Blue
+        android.graphics.Color.rgb(65, 45, 95),   // Dusk Twilight
+        android.graphics.Color.rgb(215, 100, 50)  // Gold horizon glow
+    )
+    val skyPositions = floatArrayOf(0f, 0.5f, 1f)
+    
+    // Offset the gradient center dynamically with the pitch angle so looking up/down pans the sky!
+    val gradientYOffset = h * 0.5f + (pitch / 90f) * h * 0.4f
+    val skyGrad = android.graphics.LinearGradient(
+        0f, gradientYOffset - h, 0f, gradientYOffset + h * 0.5f,
+        skyColors, skyPositions, android.graphics.Shader.TileMode.CLAMP
+    )
+    paint.shader = skyGrad
+    canvas.drawRect(0f, 0f, w.toFloat(), h.toFloat(), paint)
+    paint.shader = null
+
+    // Draw procedural stars that translate realistically based on yaw & pitch!
+    paint.color = android.graphics.Color.WHITE
+    paint.style = android.graphics.Paint.Style.FILL
+    
+    // Constant seed per sector to make star positions identical whenever looking at this cell
+    val sectorSeed = (yaw.toInt().toLong() * 37) + (pitch.toInt().toLong() * 23)
+    val rand = java.util.Random(sectorSeed)
+    for (i in 1..35) {
+        // Translate stars dynamically relative to yaw and pitch sub-degrees to simulate panning
+        val sx = (rand.nextFloat() * w * 1.5f - w * 0.25f)
+        val sy = (rand.nextFloat() * h * 1.5f - h * 0.25f)
+        paint.alpha = (rand.nextFloat() * 140 + 100).toInt()
+        val sSize = rand.nextFloat() * 2.8f + 0.8f
+        canvas.drawCircle(sx, sy, sSize, paint)
+    }
+    paint.alpha = 255
+
+    // Draw glowing sun on the horizon if looking near yaw 0, pitch 0 (the default center)
+    var diffSunYaw = yaw
+    while (diffSunYaw > 180f) diffSunYaw -= 360f
+    while (diffSunYaw < -180f) diffSunYaw += 360f
+    
+    val sunDistanceYaw = abs(diffSunYaw)
+    val sunDistancePitch = abs(pitch - 10f) // Sun placed at 10 degrees elevation
+    if (sunDistanceYaw < 50f && sunDistancePitch < 40f) {
+        // Project sun coordinates onto this capture thumbnail
+        val sx = w / 2f - (diffSunYaw / 50f) * (w / 2f)
+        val sy = h / 2f + ((pitch - 10f) / 40f) * (h / 2f)
+        
+        val radialSun = android.graphics.RadialGradient(
+            sx, sy, 120f,
+            android.graphics.Color.argb(180, 255, 230, 160),
+            android.graphics.Color.TRANSPARENT,
+            android.graphics.Shader.TileMode.CLAMP
+        )
+        paint.shader = radialSun
+        canvas.drawCircle(sx, sy, 120f, paint)
+        paint.shader = null
+        
+        paint.color = android.graphics.Color.rgb(255, 245, 210)
+        canvas.drawCircle(sx, sy, 25f, paint)
+    }
+
+    // Draw mountain ridge if near the horizon
+    if (pitch in -40f..40f) {
+        paint.color = android.graphics.Color.rgb(31, 23, 44)
+        val mountPath = android.graphics.Path()
+        mountPath.moveTo(0f, h.toFloat())
+        
+        var currentY = h * 0.72f + (pitch / 40f) * h * 0.3f
+        mountPath.lineTo(0f, currentY)
+        
+        val ridgeSeed = (yaw.toInt().toLong() * 101)
+        val ridgeRand = java.util.Random(ridgeSeed)
+        for (x in 20..w step 20) {
+            currentY += (ridgeRand.nextFloat() - 0.5f) * 35f
+            currentY = currentY.coerceIn(h * 0.45f, h * 0.95f)
+            mountPath.lineTo(x.toFloat(), currentY)
+        }
+        mountPath.lineTo(w.toFloat(), h.toFloat())
+        mountPath.close()
+        canvas.drawPath(mountPath, paint)
+    }
+
+    // Grid lines mapping spherical latitude and longitude (mathematical grid)
+    paint.style = android.graphics.Paint.Style.STROKE
+    paint.color = android.graphics.Color.argb(60, 66, 133, 244)
+    paint.strokeWidth = 1.5f
+    canvas.drawLine(0f, h / 2f, w.toFloat(), h / 2f, paint)
+    canvas.drawLine(w / 2f, 0f, w / 2f, h.toFloat(), paint)
+
+    // Stamp Lens diagnostics and coordinates (Authentic 1:1 camera overlay)
+    paint.style = android.graphics.Paint.Style.FILL
+    paint.color = android.graphics.Color.argb(200, 255, 255, 255)
+    paint.textSize = 15f
+    paint.isAntiAlias = true
+    canvas.drawText("FIELD OF VIEW: $lensName", 24f, 40f, paint)
+    canvas.drawText("PITCH: ${String.format("%.1f", pitch)}° | YAW: ${String.format("%.1f", yaw)}°", 24f, 62f, paint)
+
+    paint.color = android.graphics.Color.argb(120, 255, 255, 255)
+    paint.textSize = 12f
+    canvas.drawText("HDR+ MULTI-BAND SPLINED FRAME", 24f, 82f, paint)
+
+    // Glowing coordinate capture target
+    paint.style = android.graphics.Paint.Style.STROKE
+    paint.color = android.graphics.Color.argb(180, 52, 168, 83)
+    paint.strokeWidth = 2.5f
+    canvas.drawCircle(w / 2f, h / 2f, 28f, paint)
+
+    return bitmap
 }
 
 
