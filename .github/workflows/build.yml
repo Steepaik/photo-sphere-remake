@@ -1,0 +1,56 @@
+name: Mobile Cloud Build
+
+on:
+  push:
+    branches:
+      - '**' # This forces it to run on absolutely any branch push, no matter what
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Java JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
+
+      - name: Locate Project and Run Gradle Build
+        run: |
+          TARGET_DIR=$(find . -name "build.gradle" -o -name "build.gradle.kts" | head -n 1 | xargs dirname)
+          
+          if [ -z "$TARGET_DIR" ]; then
+            echo "Error: Could not find a build.gradle file anywhere in this repository!"
+            exit 1
+          fi
+          
+          echo "Target project directory found at: $TARGET_DIR"
+          cd "$TARGET_DIR"
+          
+          # Generate the missing debug.keystore with standard Android credentials
+          echo "Generating the missing debug.keystore file..."
+          keytool -genkey -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+
+          if [ -f "gradlew" ]; then
+            echo "Gradle wrapper exists. Granting permissions..."
+            chmod +x gradlew
+            ./gradlew assembleDebug
+          else
+            echo "Gradle wrapper is missing! Generating a new one..."
+            gradle wrapper
+            chmod +x gradlew
+            ./gradlew assembleDebug
+          fi
+
+      - name: Upload Compiled APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: my-compiled-apk
+          path: "**/build/outputs/apk/debug/*.apk"
+          
