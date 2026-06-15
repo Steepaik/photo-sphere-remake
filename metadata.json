@@ -1,0 +1,6 @@
+{
+  "name": "Photo Sphere",
+  "description": "GCam-grade Photo Sphere capture with sensor fusion, multi-lens calibration, RAW Linear DNG output, and an interactive 360-degree viewer.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
