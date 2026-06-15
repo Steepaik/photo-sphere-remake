@@ -239,6 +239,11 @@ class StitchingPipeline {
         nodes: List<PhotoSphereNode>,
         selectedLens: String,
         rawOutput: Boolean,
+        burstCount: Int = 9,
+        noisePower: Float = 55f,
+        detailPower: Float = 40f,
+        toneCurve: String = "Cinematic (GCam Modern)",
+        seamRadius: Float = 64f,
         userUpdateProgress: (Float) -> Unit
     ): Bitmap {
         InstanceState = PipelineState(
@@ -251,6 +256,9 @@ class StitchingPipeline {
 
         // ------------------ PHASE 1: HDR+ FUSION ------------------
         addLog("Initializing real-time multi-frame HDR+ Processing Engine...")
+        addLog("[CONFIG] Burst Strength: $burstCount frames | Tone Curve: $toneCurve")
+        addLog("[CONFIG] Spatial Noise Reducer: $noisePower% | Detail Booster: $detailPower%")
+        addLog("[CONFIG] Seam Blending Boundary: ${seamRadius.toInt()}px spline margins")
         addLog("System parameter: Selected lens is $selectedLens (scaling coefficients updated).")
         delay(600)
         
@@ -264,10 +272,10 @@ class StitchingPipeline {
             
             if (wasCap) {
                 InstanceState = InstanceState.copy(processedNodes = InstanceState.processedNodes + 1)
-                addLog(" -> HDR+ Merging burst frames for Node $code (Merging 12 linear exposures)...")
+                addLog(" -> HDR+ Merging spatial burst stack ($burstCount frames) for Node $code...")
                 delay(120)
                 addLog(" -> Applied subpixel shift alignment, Super-Resolution details established.")
-                addLog(" -> Anisotropic Gaussian noise coefficients parsed: kernel sigma = 1.34")
+                addLog(" -> Spatial NR Filter: power = $noisePower% | kernels parsed: sigma = ${(noisePower / 40f).coerceAtLeast(0.5f)}")
             } else {
                 addLog(" -> Node $code remains vacant. Processing skipped. Linear interpolations will bridge.")
             }
@@ -404,13 +412,17 @@ class StitchingPipeline {
     }
 
     // High fidelity Linear DNG dynamic raw processing:
-    // Develops a rendering from 16-bit linear bitmap with adjusted parameters
+    // Develops a rendering from 16-bit linear bitmap with adjusted parameters in Google Camera-style
     fun developLinearDng(
         baseBitmap: Bitmap,
-        exposure: Float,          // [-3.0f, +3.0f]
-        highlights: Float,         // [-100f, +100f]
-        shadows: Float,            // [-100f, +100f]
-        tempCelsius: Float         // [2000K, 10000K] (scaled -1 to 1 for offset)
+        exposure: Float,                    // [-3.0f, +3.0f]
+        highlights: Float,                  // [-100f, +100f]
+        shadows: Float,                     // [-100f, +100f]
+        tempCelsius: Float,                 // White Balance [-1.0f, +1.0f]
+        toneCurvePreset: String = "Cinematic (GCam Modern)", // Tone Curves
+        localContrast: Float = 35f,        // Mid-tone edge contrast [0f, 100f]
+        detailBoost: Float = 40f,          // Local detail sharpening [0f, 100f]
+        vignette: Float = 25f               // Radial lens vignetting [0f, 100f]
     ): Bitmap {
         val width = baseBitmap.width
         val height = baseBitmap.height
@@ -426,10 +438,16 @@ class StitchingPipeline {
         val hlCoeff = 1.0f - (highlights / 200f) // If highlights = -100, we pull down high lights
         val shCoeff = 1.0f + (shadows / 200f)    // If shadows = +100, we boost low values
 
-        // Simple white balance multipliers based on temperature (Celsius/Kelvin)
-        // Red multiplier is higher at low temps (warm), Blue is higher at high temps (cool)
+        // Simple white balance multipliers based on temperature
         val rWB = 1.0f - (tempCelsius * 0.15f)
         val bWB = 1.0f + (tempCelsius * 0.15f)
+
+        // Custom parameters for sharpening / local contrast
+        val contrastFactor = 1.0f + (localContrast / 150f)
+        val sharpnessCoeff = detailBoost / 100f
+
+        val halfW = width / 2.0f
+        val halfH = height / 2.0f
 
         for (i in pixels.indices) {
             val color = pixels[i]
@@ -438,8 +456,7 @@ class StitchingPipeline {
             var g = Color.green(color).toFloat()
             var b = Color.blue(color).toFloat()
 
-            // 1. Convert to a simulated 16-bit Linear float workspace [0f, 255f]
-            // We apply an inverse gamma curve to work in linear space!
+            // 1. Convert to a simulated 16-bit Linear float workspace [0f, 255f] using 2.2 Gamma expansion
             r = Math.pow((r / 255.0), 2.2).toFloat() * 255f
             g = Math.pow((g / 255.0), 2.2).toFloat() * 255f
             b = Math.pow((b / 255.0), 2.2).toFloat() * 255f
@@ -454,24 +471,92 @@ class StitchingPipeline {
             b *= expMultiple
 
             // 4. Highlight Recovery (Luminance based compression)
-            val lum = 0.2126f * r + 0.7152f * g + 0.0722f * b
-            if (lum > 170f) {
-                val compress = (170f + (lum - 170f) * hlCoeff) / lum
+            var lum = 0.2126f * r + 0.7152f * g + 0.0722f * b
+            if (lum > 150f && lum > 0f) {
+                val compress = (150f + (lum - 150f) * hlCoeff) / lum
                 r *= compress
                 g *= compress
                 b *= compress
             }
 
             // 5. Shadow Boosting
-            if (lum < 60f && lum > 0f) {
-                // Boost deep shadows
-                val boost = (lum + (60f - lum) * (shCoeff - 1f)) / lum
+            lum = 0.2126f * r + 0.7152f * g + 0.0722f * b
+            if (lum < 75f && lum > 0f) {
+                val boost = (lum + (75f - lum) * (shCoeff - 1f)) / lum
                 r *= boost
                 g *= boost
                 b *= boost
             }
 
-            // 6. Convert back to sRGB Gamma space
+            // 6. Local Contrast Enhance (Centering around 120.0f mid-tone)
+            if (localContrast > 0f) {
+                r = 120f + (r - 120f) * contrastFactor
+                g = 120f + (g - 120f) * contrastFactor
+                b = 120f + (b - 120f) * contrastFactor
+            }
+
+            // 7. Local Edge Sharpening of individual colors (high-pass edge difference emulation)
+            if (sharpnessCoeff > 0f) {
+                val diffR = r - lum
+                val diffG = g - lum
+                val diffB = b - lum
+                r += diffR * sharpnessCoeff * 0.4f
+                g += diffG * sharpnessCoeff * 0.4f
+                b += diffB * sharpnessCoeff * 0.4f
+            }
+
+            // 8. Custom Tone Curve Presets mappings
+            var normR = (r / 255f).coerceIn(0f, 1f)
+            var normG = (g / 255f).coerceIn(0f, 1f)
+            var normB = (b / 255f).coerceIn(0f, 1f)
+            
+            when {
+                toneCurvePreset.contains("Cinematic") -> {
+                    // S-Curve Spline
+                    normR = (1.0 / (1.0 + Math.exp(-9.0 * (normR.toDouble() - 0.5)))).toFloat().coerceIn(0f, 1f)
+                    normG = (1.0 / (1.0 + Math.exp(-9.0 * (normG.toDouble() - 0.5)))).toFloat().coerceIn(0f, 1f)
+                    normB = (1.0 / (1.0 + Math.exp(-9.0 * (normB.toDouble() - 0.5)))).toFloat().coerceIn(0f, 1f)
+                }
+                toneCurvePreset.contains("Contrast") -> {
+                    // Deep Contrast S-Curve
+                    normR = (Math.sin((normR - 0.5) * Math.PI) * 0.5 + 0.5).toFloat().coerceIn(0f, 1f)
+                    normR = (3 * normR * normR - 2 * normR * normR * normR) // Hermite Cubic
+                    normG = (Math.sin((normG - 0.5) * Math.PI) * 0.5 + 0.5).toFloat().coerceIn(0f, 1f)
+                    normG = (3 * normG * normG - 2 * normG * normG * normG)
+                    normB = (Math.sin((normB - 0.5) * Math.PI) * 0.5 + 0.5).toFloat().coerceIn(0f, 1f)
+                    normB = (3 * normB * normB - 2 * normB * normB * normB)
+                }
+                toneCurvePreset.contains("Astro") -> {
+                    // Pull low darks way down, boost high dynamic highlights up
+                    val gammaAstro = 1.35f
+                    normR = Math.pow(normR.toDouble(), gammaAstro.toDouble()).toFloat()
+                    normG = Math.pow(normG.toDouble(), gammaAstro.toDouble()).toFloat()
+                    normB = Math.pow(normB.toDouble(), gammaAstro.toDouble()).toFloat()
+                    
+                    if (normR > 0.6f) normR = (0.6f + (normR - 0.6f) * 1.25f).coerceIn(0f, 1f)
+                    if (normG > 0.6f) normG = (0.6f + (normG - 0.6f) * 1.25f).coerceIn(0f, 1f)
+                    if (normB > 0.6f) normB = (0.6f + (normB - 0.6f) * 1.25f).coerceIn(0f, 1f)
+                }
+                // Balanced Flat requires no curve warping
+            }
+            r = normR * 255f
+            g = normG * 255f
+            b = normB * 255f
+
+            // 9. Radial Lens Vignetting
+            if (vignette > 0f) {
+                val col = i % width
+                val row = i / width
+                val dx = (col - halfW) / halfW
+                val dy = (row - halfH) / halfH
+                val radiusSq = dx * dx + dy * dy
+                val vigFactor = (1.0f - (vignette / 100f) * 0.35f * radiusSq).coerceIn(0.2f, 1.0f)
+                r *= vigFactor
+                g *= vigFactor
+                b *= vigFactor
+            }
+
+            // 10. Gamma Compression back to sRGB space [0..255]
             r = Math.pow((r.coerceIn(0f, 255f) / 255.0), 1.0 / 2.2).toFloat() * 255f
             g = Math.pow((g.coerceIn(0f, 255f) / 255.0), 1.0 / 2.2).toFloat() * 255f
             b = Math.pow((b.coerceIn(0f, 255f) / 255.0), 1.0 / 2.2).toFloat() * 255f

@@ -38,12 +38,14 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
@@ -99,6 +101,15 @@ fun PhotoSphereApp() {
     var rawOutputEnabled by remember { mutableStateFlowState(true) }
     var autoCaptureEnabled by remember { mutableStateFlowState(true) }
 
+    // Advanced Configurable Settings (GCam System)
+    var hdPlusBurstCount by remember { mutableStateFlowState(9) }                     // 3, 9, 15 frame stacks
+    var noiseReductionPower by remember { mutableStateFlowState(55f) }                // [0f, 100f]
+    var detailEnhancementPower by remember { mutableStateFlowState(40f) }             // [0f, 100f]
+    var toneCurveSelection by remember { mutableStateFlowState("Cinematic (GCam Modern)") } // Cinematic, Contrast, Astro, Balanced Flat
+    var seamBlendingRadius by remember { mutableStateFlowState(64f) }                // [16f, 128f]
+    var vibrationPower by remember { mutableStateFlowState("Subtle Pulse") }          // None, Subtle Pulse, Tactile snap
+    var captureSoundEffect by remember { mutableStateFlowState("Standard Shutter") }  // Muted, Standard Shutter, Electronic Beep
+
     // Active capture tracking
     var nodesList by remember { mutableStateFlowState(generateNodesForLens("Wide (1x)")) }
     var activeNodeIdInBurst by remember { mutableStateFlowState<String?>(null) }
@@ -135,6 +146,10 @@ fun PhotoSphereApp() {
     var dngHighlights by remember { mutableStateFlowState(0f) }
     var dngShadows by remember { mutableStateFlowState(0f) }
     var dngTemperature by remember { mutableStateFlowState(0f) } // Offset [-1, 1]
+    var dngToneCurve by remember { mutableStateFlowState("Cinematic (GCam Modern)") }
+    var dngLocalContrast by remember { mutableStateFlowState(35f) }
+    var dngDetailBoost by remember { mutableStateFlowState(40f) }
+    var dngVignette by remember { mutableStateFlowState(25f) }
     var isDevelopingOverlay by remember { mutableStateFlowState(false) }
 
     // Selected Panorama for inspection/viewer
@@ -259,6 +274,17 @@ fun PhotoSphereApp() {
                         selectedLens = selectedLens,
                         rawOutputEnabled = rawOutputEnabled,
                         autoCaptureEnabled = autoCaptureEnabled,
+                        onAutoCaptureToggle = { autoCaptureEnabled = it },
+                        hdPlusBurstCount = hdPlusBurstCount,
+                        onHdPlusBurstCountChange = { hdPlusBurstCount = it },
+                        noiseReductionPower = noiseReductionPower,
+                        onNoiseReductionPowerChange = { noiseReductionPower = it },
+                        detailEnhancementPower = detailEnhancementPower,
+                        onDetailEnhancementPowerChange = { detailEnhancementPower = it },
+                        vibrationPower = vibrationPower,
+                        onVibrationPowerChange = { vibrationPower = it },
+                        captureSoundEffect = captureSoundEffect,
+                        onCaptureSoundEffectChange = { captureSoundEffect = it },
                         nodes = nodesList,
                         currentYaw = currentYaw,
                         currentPitch = currentPitch,
@@ -273,8 +299,8 @@ fun PhotoSphereApp() {
                         activeBurstProgress = activeBurstProgress,
                         onTriggerBurstCapture = { node ->
                             scope.launch {
-                                playShutterSoundCombined(context)
-                                playHapticVibe(context)
+                                playShutterSoundCombined(context, captureSoundEffect)
+                                playHapticVibe(context, vibrationPower)
                                 activeNodeIdInBurst = node.id
                                 for (prog in 1..10) {
                                     delayLonger(75)
@@ -297,7 +323,12 @@ fun PhotoSphereApp() {
                                 val outBmp = pipeline.runStitchingPipelineAsync(
                                     nodesList,
                                     selectedLens,
-                                    rawOutputEnabled
+                                    rawOutputEnabled,
+                                    burstCount = hdPlusBurstCount,
+                                    noisePower = noiseReductionPower,
+                                    detailPower = detailEnhancementPower,
+                                    toneCurve = toneCurveSelection,
+                                    seamRadius = seamBlendingRadius
                                 ) { prog ->
                                     processingProgress = prog
                                 }
@@ -347,21 +378,37 @@ fun PhotoSphereApp() {
                         highlights = dngHighlights,
                         shadows = dngShadows,
                         tempOffset = dngTemperature,
+                        toneCurvePreset = dngToneCurve,
+                        localContrast = dngLocalContrast,
+                        detailBoost = dngDetailBoost,
+                        vignette = dngVignette,
                         activeMode = activeViewerMode,
                         isDeveloping = isDevelopingOverlay,
                         onModeChange = { activeViewerMode = it },
-                        onParamsChange = { exp, hl, sh, temp ->
+                        onParamsChange = { exp, hl, sh, temp, curve, contrast, detail, vig ->
                             dngExposure = exp
                             dngHighlights = hl
                             dngShadows = sh
                             dngTemperature = temp
+                            dngToneCurve = curve
+                            dngLocalContrast = contrast
+                            dngDetailBoost = detail
+                            dngVignette = vig
                         },
                         onReprocess = {
                             scope.launch {
                                 isDevelopingOverlay = true
                                 computedStitchedBitmap?.let { base ->
                                     val dev = pipeline.developLinearDng(
-                                        base, dngExposure, dngHighlights, dngShadows, dngTemperature
+                                        baseBitmap = base,
+                                        exposure = dngExposure,
+                                        highlights = dngHighlights,
+                                        shadows = dngShadows,
+                                        tempCelsius = dngTemperature,
+                                        toneCurvePreset = dngToneCurve,
+                                        localContrast = dngLocalContrast,
+                                        detailBoost = dngDetailBoost,
+                                        vignette = dngVignette
                                     )
                                     currentDevelopedBitmap = dev
                                 }
@@ -387,24 +434,32 @@ suspend fun delayLonger(millis: Long) {
     kotlinx.coroutines.delay(millis)
 }
 
-fun playShutterSoundCombined(context: Context) {
+fun playShutterSoundCombined(context: Context, soundEffectType: String) {
+    if (soundEffectType == "Muted") return
     try {
         val tone = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 95)
-        tone.startTone(ToneGenerator.TONE_PROP_BEEP, 150)
+        if (soundEffectType == "Electronic Beep") {
+            tone.startTone(ToneGenerator.TONE_CDMA_PIP, 80)
+        } else {
+            // Standard Shutter beep
+            tone.startTone(ToneGenerator.TONE_PROP_BEEP, 160)
+        }
     } catch (e: Exception) {
         Log.e("AudioError", "Shutter audio failed", e)
     }
 }
 
-fun playHapticVibe(context: Context) {
+fun playHapticVibe(context: Context, vibrationStyle: String) {
+    if (vibrationStyle == "None") return
     try {
         val vibrator = context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator?
         if (vibrator != null && vibrator.hasVibrator()) {
+            val duration = if (vibrationStyle == "Tactile snap") 80L else 35L
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                vibrator.vibrate(android.os.VibrationEffect.createOneShot(40, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
+                vibrator.vibrate(android.os.VibrationEffect.createOneShot(duration, android.os.VibrationEffect.DEFAULT_AMPLITUDE))
             } else {
                 @Suppress("DEPRECATION")
-                vibrator.vibrate(40)
+                vibrator.vibrate(duration)
             }
         }
     } catch (e: Exception) {
@@ -783,6 +838,17 @@ fun CaptureScreen(
     selectedLens: String,
     rawOutputEnabled: Boolean,
     autoCaptureEnabled: Boolean,
+    onAutoCaptureToggle: (Boolean) -> Unit,
+    hdPlusBurstCount: Int,
+    onHdPlusBurstCountChange: (Int) -> Unit,
+    noiseReductionPower: Float,
+    onNoiseReductionPowerChange: (Float) -> Unit,
+    detailEnhancementPower: Float,
+    onDetailEnhancementPowerChange: (Float) -> Unit,
+    vibrationPower: String,
+    onVibrationPowerChange: (String) -> Unit,
+    captureSoundEffect: String,
+    onCaptureSoundEffectChange: (String) -> Unit,
     nodes: List<PhotoSphereNode>,
     currentYaw: Float,
     currentPitch: Float,
@@ -801,6 +867,7 @@ fun CaptureScreen(
     val context = LocalContext.current
     val totalCaptured = nodes.filter { it.captured }.size
     val totalProgress = totalCaptured.toFloat() / nodes.size
+    var isSettingsOverlayOpen by remember { mutableStateFlowState(false) }
 
     Box(
         modifier = Modifier
@@ -870,7 +937,7 @@ fun CaptureScreen(
         }
 
         // --- SENSOR REGISTRATION TARGETS OVERLAY ---
-        // Projecting the 3D geodesic nodes onto the 2D viewfinder coordinate plane
+        // Projecting the 3D geodesic nodes onto the 2D viewfinder coordinate plane isotropically
         Canvas(
             modifier = Modifier
                 .fillMaxSize()
@@ -887,77 +954,17 @@ fun CaptureScreen(
         ) {
             val width = size.width
             val height = size.height
-            
-            // Camera Field of View mapping bounds (e.g. wide horizontal 45 deg, vertical 60 deg)
-            val hFov = 45f
-            val vFov = 60f
 
-            nodes.forEach { node ->
-                if (node.id == activeNodeIdInBurst) return@forEach // don't draw overlapping targets while capturing
+            // 1. Uniform (isotropic) pixel scale to resolve stretching/warping
+            val hFov = 48f
+            val scale = width / hFov
 
-                // Compute yaw offset boundary wrapping cyclically [-180, 180]
-                var diffYaw = node.targetYaw - currentYaw
-                while (diffYaw > 180f) diffYaw -= 360f
-                while (diffYaw < -180f) diffYaw += 360f
-
-                val diffPitch = node.targetPitch - currentPitch
-
-                // Only draw nodes that are in front of the lens viewport
-                if (abs(diffYaw) < 50f && abs(diffPitch) < 55f) {
-                    // Orthographic projection
-                    val px = (width / 2f) + (diffYaw / hFov) * (width / 2f)
-                    val py = (height / 2f) - (diffPitch / vFov) * (height / 2f)
-
-                    val isAligned = abs(diffYaw) < 1.4f && abs(diffPitch) < 1.4f
-
-                    // If node is already captured, draw a solid blue verification indicator
-                    val ringColor = when {
-                        node.captured -> Color(0xFF4285F4)
-                        isAligned -> Color(0xFF64B5F6)
-                        else -> Color.White.copy(alpha = 0.65f)
-                    }
-
-                    // Floating target dot
-                    drawCircle(
-                        color = ringColor,
-                        radius = if (isAligned) 14f else 8f,
-                        center = Offset(px, py)
-                    )
-
-                    // Surrounding dotted lock circle indicating proximity alignment boundary
-                    if (!node.captured) {
-                        drawCircle(
-                            color = ringColor.copy(alpha = 0.4f),
-                            radius = if (isAligned) 24f else 18f,
-                            center = Offset(px, py),
-                            style = Stroke(width = 1.5f)
-                        )
-                    } else {
-                        // Drawing checkmark details
-                        drawLine(
-                            color = Color.White,
-                            start = Offset(px - 4f, py),
-                            end = Offset(px - 1f, py + 3f),
-                            strokeWidth = 2f
-                        )
-                        drawLine(
-                            color = Color.White,
-                            start = Offset(px - 1f, py + 3f),
-                            end = Offset(px + 5f, py - 3f),
-                            strokeWidth = 2f
-                        )
-                    }
-                }
-            }
-
-            // --- VIEW VIEWFINDER HUD GRAPH DISTORTIONS / DETAILS ---
-            // Draw SIFT feature trackers popping over high contrast scenic spots
+            // Draw SIFT feature trackers popping over high contrast scenic spots (ambient)
             val starSeed = 999L
             val random = java.util.Random(starSeed)
             for (idx in 0..12) {
                 val fx = random.nextFloat() * width
                 val fy = random.nextFloat() * height
-                // Intermittent flashing
                 if (random.nextBoolean()) {
                     drawCircle(
                         Color(0xFF34A853).copy(alpha = 0.25f),
@@ -976,84 +983,286 @@ fun CaptureScreen(
                     )
                 }
             }
+
+            // 2. COUNTERACT DEVICE ROLL TILT FOR REAL-WORLD ALIGNMENT
+            // Tapping rotate makes all the 3D spheres rotate in inverse roll, stabilizing them perfectly with real-world gravity!
+            rotate(degrees = -currentRoll, pivot = Offset(width / 2f, height / 2f)) {
+                nodes.forEach { node ->
+                    if (node.id == activeNodeIdInBurst) return@forEach
+
+                    var diffYaw = node.targetYaw - currentYaw
+                    while (diffYaw > 180f) diffYaw -= 360f
+                    while (diffYaw < -180f) diffYaw += 360f
+
+                    val diffPitch = node.targetPitch - currentPitch
+
+                    // Draw if within viewport angle (an isotropic circle of 40 degrees)
+                    val distDeg = sqrt(diffYaw * diffYaw + diffPitch * diffPitch)
+                    if (distDeg < 40f) {
+                        val px = (width / 2f) + (diffYaw * scale)
+                        val py = (height / 2f) - (diffPitch * scale)
+
+                        val isAligned = abs(diffYaw) < 1.8f && abs(diffPitch) < 1.8f
+
+                        val ringColor = when {
+                            node.captured -> Color(0xFF4285F4)
+                            isAligned -> Color(0xFF34A853) // Green lock success!
+                            else -> Color.White.copy(alpha = 0.7f)
+                        }
+
+                        // Target core point
+                        drawCircle(
+                            color = ringColor,
+                            radius = if (isAligned) 14f else 8f,
+                            center = Offset(px, py)
+                        )
+
+                        // Outer alignment guide shell
+                        if (!node.captured) {
+                            drawCircle(
+                                color = ringColor.copy(alpha = 0.45f),
+                                radius = if (isAligned) 24f else 18f,
+                                center = Offset(px, py),
+                                style = Stroke(width = 2f)
+                            )
+                        } else {
+                            // Draw vector checkmark inside captured points
+                            drawLine(
+                                color = Color.White,
+                                start = Offset(px - 4f, py),
+                                end = Offset(px - 1f, py + 3f),
+                                strokeWidth = 2.5f
+                            )
+                            drawLine(
+                                color = Color.White,
+                                start = Offset(px - 1f, py + 3f),
+                                end = Offset(px + 5f, py - 3f),
+                                strokeWidth = 2.5f
+                            )
+                        }
+                    }
+                }
+            }
+
+            // 3. GLOWING NAVIGATION ARROW GUIDANCE TOWARDS THE NEAREST UNCAPTURED TILE
+            // Drawing the arrow OUTSIDE the roll rotation block so it stays strictly aligned with the camera's frame/reticle
+            val closestTarget = nodes.filter { !it.captured }.minByOrNull { node ->
+                var dy = node.targetYaw - currentYaw
+                while (dy > 180f) dy -= 360f
+                while (dy < -180f) dy += 360f
+                val dp = node.targetPitch - currentPitch
+                dy * dy + dp * dp
+            }
+
+            closestTarget?.let { node ->
+                var dy = node.targetYaw - currentYaw
+                while (dy > 180f) dy -= 360f
+                while (dy < -180f) dy += 360f
+                val dp = node.targetPitch - currentPitch
+
+                val dist = sqrt(dy*dy + dp*dp)
+                if (dist > 1.8f) {
+                    // Calculate screenspace direction angle in radians
+                    val angleRad = atan2(-dp, dy)
+
+                    // Position arrow along reticle perimeter (e.g., radius of 110f around center)
+                    val arrowRadius = 110f
+                    val arrowCenterX = width / 2f + cos(angleRad) * arrowRadius
+                    val arrowCenterY = height / 2f + sin(angleRad) * arrowRadius
+
+                    val angleDeg = Math.toDegrees(angleRad.toDouble()).toFloat()
+
+                    // Render beautiful triangle arrow rotatably aligned
+                    rotate(degrees = angleDeg, pivot = Offset(arrowCenterX, arrowCenterY)) {
+                        val arrowPath = AndroidPath().apply {
+                            moveTo(arrowCenterX + 14f, arrowCenterY)
+                            lineTo(arrowCenterX - 10f, arrowCenterY - 9f)
+                            lineTo(arrowCenterX - 10f, arrowCenterY + 9f)
+                            close()
+                        }
+                        this.drawContext.canvas.nativeCanvas.drawPath(
+                            arrowPath,
+                            AndroidPaint().apply {
+                                color = AndroidColor.rgb(66, 133, 244) // Google Camera Brand Blue
+                                style = AndroidPaint.Style.FILL
+                                isAntiAlias = true
+                                setShadowLayer(10f, 0f, 0f, AndroidColor.argb(200, 66, 133, 244))
+                            }
+                        )
+                    }
+                }
+            }
         }
 
-        // --- LEVELING CALIBRATION HORIZON HUD ---
-        // Classic yellow & white overlapping horizon alignment gauges from GCam
+        // --- LEVELING CALIBRATION HORIZON HUD & FLOATING GUIDANCE PIL --
+        // Classic yellow & white overlapping horizon alignment gauges from GCam plus real-time panic instructions
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(bottom = 80.dp),
+                .padding(bottom = 70.dp),
             contentAlignment = Alignment.Center
         ) {
-            Canvas(
-                modifier = Modifier
-                    .size(240.dp)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(16.dp)
             ) {
-                val cx = size.width / 2f
-                val cy = size.height / 2f
+                Canvas(
+                    modifier = Modifier.size(240.dp)
+                ) {
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
 
-                // Central high target bounding ring (GCam Reticle lock target)
-                drawCircle(
-                    color = Color.White.copy(alpha = 0.25f),
-                    radius = 35f,
-                    center = Offset(cx, cy),
-                    style = Stroke(width = 1.5f)
-                )
+                    // Central high target bounding ring (GCam Reticle lock target)
+                    drawCircle(
+                        color = Color.White.copy(alpha = 0.25f),
+                        radius = 35f,
+                        center = Offset(cx, cy),
+                        style = Stroke(width = 1.5f)
+                    )
 
-                // 1. White fixed horizontal leveler indicator (pitch zero baseline)
-                drawLine(
-                    color = Color.White.copy(alpha = 0.3f),
-                    start = Offset(cx - 80f, cy),
-                    end = Offset(cx - 40f, cy),
-                    strokeWidth = 2f
-                )
-                drawLine(
-                    color = Color.White.copy(alpha = 0.3f),
-                    start = Offset(cx + 40f, cy),
-                    end = Offset(cx + 80f, cy),
-                    strokeWidth = 2f
-                )
+                    // 1. White fixed horizontal leveler indicator (pitch zero baseline)
+                    drawLine(
+                        color = Color.White.copy(alpha = 0.3f),
+                        start = Offset(cx - 80f, cy),
+                        end = Offset(cx - 40f, cy),
+                        strokeWidth = 2f
+                    )
+                    drawLine(
+                        color = Color.White.copy(alpha = 0.3f),
+                        start = Offset(cx + 40f, cy),
+                        end = Offset(cx + 80f, cy),
+                        strokeWidth = 2f
+                    )
 
-                // 2. Yellow dynamic rotatable indicator corresponding to actual physical pitch & roll
-                // Rolled tilt calculation
-                val rollRad = Math.toRadians(currentRoll.toDouble()).toFloat()
-                val deltaYPitch = currentPitch * 2.5f // pitch translational scaling offset
+                    // 2. Yellow dynamic rotatable indicator corresponding to actual physical pitch & roll
+                    // Rolled tilt calculation
+                    val rollRad = Math.toRadians(currentRoll.toDouble()).toFloat()
+                    val deltaYPitch = currentPitch * 2.5f // pitch translational scaling offset
 
-                val length = 40f
-                val gap = 40f
+                    val length = 40f
+                    val gap = 40f
 
-                // Rotate level lines according to tilt
-                val cosR = cos(rollRad)
-                val sinR = sin(rollRad)
+                    // Rotate level lines according to tilt
+                    val cosR = cos(rollRad)
+                    val sinR = sin(rollRad)
 
-                val leftLineStartX = cx - (gap + length) * cosR + deltaYPitch * sinR
-                val leftLineStartY = cy - (gap + length) * sinR - deltaYPitch * cosR
-                val leftLineEndX = cx - gap * cosR + deltaYPitch * sinR
-                val leftLineEndY = cy - gap * sinR - deltaYPitch * cosR
+                    val leftLineStartX = cx - (gap + length) * cosR + deltaYPitch * sinR
+                    val leftLineStartY = cy - (gap + length) * sinR - deltaYPitch * cosR
+                    val leftLineEndX = cx - gap * cosR + deltaYPitch * sinR
+                    val leftLineEndY = cy - gap * sinR - deltaYPitch * cosR
 
-                val rightLineStartX = cx + gap * cosR + deltaYPitch * sinR
-                val rightLineStartY = cy + gap * sinR - deltaYPitch * cosR
-                val rightLineEndX = cx + (gap + length) * cosR + deltaYPitch * sinR
-                val rightLineEndY = cy + (gap + length) * sinR - deltaYPitch * cosR
+                    val rightLineStartX = cx + gap * cosR + deltaYPitch * sinR
+                    val rightLineStartY = cy + gap * sinR - deltaYPitch * cosR
+                    val rightLineEndX = cx + (gap + length) * cosR + deltaYPitch * sinR
+                    val rightLineEndY = cy + (gap + length) * sinR - deltaYPitch * cosR
 
-                val isLeveled = abs(currentRoll) < 1.0f && abs(currentPitch) < 1.0f
-                val levelColor = if (isLeveled) Color(0xFF34A853) else Color(0xFFFBB03B)
+                    val isLeveled = abs(currentRoll) < 1.0f && abs(currentPitch) < 1.0f
+                    val levelColor = if (isLeveled) Color(0xFF34A853) else Color(0xFFFBB03B)
 
-                // Draw yellow (or green) gravity gauges
-                drawLine(
-                    color = levelColor,
-                    start = Offset(leftLineStartX, leftLineStartY),
-                    end = Offset(leftLineEndX, leftLineEndY),
-                    strokeWidth = 2.5f
-                )
-                drawLine(
-                    color = levelColor,
-                    start = Offset(rightLineStartX, rightLineStartY),
-                    end = Offset(rightLineEndX, rightLineEndY),
-                    strokeWidth = 2.5f
-                )
+                    // Draw yellow (or green) gravity gauges
+                    drawLine(
+                        color = levelColor,
+                        start = Offset(leftLineStartX, leftLineStartY),
+                        end = Offset(leftLineEndX, leftLineEndY),
+                        strokeWidth = 2.5f
+                    )
+                    drawLine(
+                        color = levelColor,
+                        start = Offset(rightLineStartX, rightLineStartY),
+                        end = Offset(rightLineEndX, rightLineEndY),
+                        strokeWidth = 2.5f
+                    )
+                }
+
+                // Real-time Guidance Direction Text Badge Pill!
+                val closestTarget = nodes.filter { !it.captured }.minByOrNull { node ->
+                    var dy = node.targetYaw - currentYaw
+                    while (dy > 180f) dy -= 360f
+                    while (dy < -180f) dy += 360f
+                    val dp = node.targetPitch - currentPitch
+                    dy * dy + dp * dp
+                }
+
+                closestTarget?.let { node ->
+                    var dy = node.targetYaw - currentYaw
+                    while (dy > 180f) dy -= 360f
+                    while (dy < -180f) dy += 360f
+                    val dp = node.targetPitch - currentPitch
+
+                    val dist = sqrt(dy*dy + dp*dp)
+                    if (dist > 1.8f) {
+                        val dirText = StringBuilder()
+                        if (abs(dy) > 1.8f) {
+                            dirText.append(if (dy > 0f) "PAN RIGHT ${dy.toInt()}°" else "PAN LEFT ${abs(dy).toInt()}°")
+                        }
+                        if (abs(dp) > 1.8f) {
+                            if (abs(dy) > 1.8f) dirText.append(" & ")
+                            dirText.append(if (dp > 0f) "TILT UP ${dp.toInt()}°" else "TILT DOWN ${abs(dp).toInt()}°")
+                        }
+
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1E212A).copy(alpha = 0.85f)),
+                            shape = RoundedCornerShape(20.dp),
+                            border = BorderStroke(1.dp, Color(0xFF4285F4).copy(alpha = 0.5f))
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.Navigation,
+                                    contentDescription = "Arrow Guide Indicator",
+                                    tint = Color(0xFF4285F4),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = dirText.toString(),
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    letterSpacing = 0.4.sp
+                                )
+                            }
+                        }
+                    } else {
+                        // Perfectly Aligned pill!
+                        Card(
+                            colors = CardDefaults.cardColors(containerColor = Color(0xFF1B3D2A)),
+                            shape = RoundedCornerShape(20.dp)
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(horizontal = 14.dp, vertical = 6.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Icon(
+                                    Icons.Default.CheckCircle,
+                                    contentDescription = "Hold still",
+                                    tint = Color(0xFF34A853),
+                                    modifier = Modifier.size(14.dp)
+                                )
+                                Text(
+                                    text = "HOLD STILL - ALIGNED!",
+                                    color = Color.White,
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        // --- CAMERA SHUTTER BLINK FADE COMPOSABLE ---
+        if (activeNodeIdInBurst != null) {
+            val flashAlpha = (1f - activeBurstProgress).coerceIn(0f, 1f)
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.White.copy(alpha = flashAlpha * 0.6f))
+            )
         }
 
         // --- ACTIVE HDR+ CAPTURING PROGRESS INDICATOR ---
@@ -1083,6 +1292,199 @@ fun CaptureScreen(
                         Spacer(modifier = Modifier.height(14.dp))
                         Text("HDR+ FUSING...", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
                         Text("Compand raw exposures", color = Color.Gray, fontSize = 9.sp)
+                    }
+                }
+            }
+        }
+
+        // --- VIEWFINDER CONFIGURABLE PREFERENCES OVERLAY ---
+        AnimatedVisibility(
+            visible = isSettingsOverlayOpen,
+            enter = slideInVertically(initialOffsetY = { -it }) + fadeIn(),
+            exit = slideOutVertically(targetOffsetY = { -it }) + fadeOut(),
+            modifier = Modifier
+                .fillMaxWidth()
+                .align(Alignment.TopCenter)
+                .padding(top = 74.dp, start = 14.dp, end = 14.dp)
+        ) {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color(0xFF16181E).copy(alpha = 0.96f)),
+                shape = RoundedCornerShape(16.dp),
+                border = BorderStroke(1.dp, Color(0xFF4285F4).copy(alpha = 0.45f)),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .testTag("preferences_drawer_card")
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "GCAM VIEWFINDER SETTINGS",
+                            style = MaterialTheme.typography.titleSmall.copy(
+                                fontWeight = FontWeight.Bold,
+                                color = Color(0xFF4285F4),
+                                letterSpacing = 0.8.sp
+                            )
+                        )
+                        IconButton(
+                            onClick = { isSettingsOverlayOpen = false },
+                            modifier = Modifier.size(24.dp)
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "Close overlay", tint = Color.Gray, modifier = Modifier.size(16.dp))
+                        }
+                    }
+
+                    Box(modifier = Modifier.fillMaxWidth().height(1.dp).background(Color(0xFF262930)))
+
+                    // 1. Overlap auto-shutter switch
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Auto Overlap Shutter", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Snaps automatically on zero-drift align", color = Color.Gray, fontSize = 9.sp)
+                        }
+                        Switch(
+                            checked = autoCaptureEnabled,
+                            onCheckedChange = onAutoCaptureToggle,
+                            colors = SwitchDefaults.colors(checkedThumbColor = Color(0xFF4285F4)),
+                            modifier = Modifier.scale(0.85f)
+                        )
+                    }
+
+                    // 2. HDR+ Burst Strength (Dropdown selector)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1.2f)) {
+                            Text("HDR+ Burst Strength", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Linear exposure stack frames", color = Color.Gray, fontSize = 9.sp)
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.weight(1.5f)
+                        ) {
+                            listOf(3, 9, 15).forEach { frames ->
+                                val isSel = frames == hdPlusBurstCount
+                                Button(
+                                    onClick = { onHdPlusBurstCountChange(frames) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isSel) Color(0xFF4285F4) else Color(0xFF242731),
+                                        contentColor = if (isSel) Color.White else Color.LightGray
+                                    ),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+                                    modifier = Modifier.weight(1f).height(24.dp)
+                                ) {
+                                    Text("${frames}F", fontSize = 9.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+
+                    // 3. Audio trigger selection sound dropdown
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1.2f)) {
+                            Text("Capture Sound Effect", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Viewfinder click tone style", color = Color.Gray, fontSize = 9.sp)
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.weight(1.5f)
+                        ) {
+                            listOf("Muted", "Standard", "Beep").forEach { sound ->
+                                val label = when(sound) {
+                                    "Standard" -> "Standard Shutter"
+                                    "Beep" -> "Electronic Beep"
+                                    else -> "Muted"
+                                }
+                                val isSel = label == captureSoundEffect
+                                Button(
+                                    onClick = { onCaptureSoundEffectChange(label) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isSel) Color(0xFF4285F4) else Color(0xFF242731),
+                                        contentColor = if (isSel) Color.White else Color.LightGray
+                                    ),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+                                    modifier = Modifier.weight(1f).height(24.dp)
+                                ) {
+                                    Text(sound, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+
+                    // 4. Vibration selector haptic strength
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1.2f)) {
+                            Text("Tactile Vibration", color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                            Text("Aligned confirmation pulse", color = Color.Gray, fontSize = 9.sp)
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.weight(1.5f)
+                        ) {
+                            listOf("None", "Subtle", "Snap").forEach { vibe ->
+                                val label = when(vibe) {
+                                    "Subtle" -> "Subtle Pulse"
+                                    "Snap" -> "Tactile snap"
+                                    else -> "None"
+                                }
+                                val isSel = label == vibrationPower
+                                Button(
+                                    onClick = { onVibrationPowerChange(label) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isSel) Color(0xFF4285F4) else Color(0xFF242731),
+                                        contentColor = if (isSel) Color.White else Color.LightGray
+                                    ),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+                                    modifier = Modifier.weight(1f).height(24.dp)
+                                ) {
+                                    Text(vibe, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+
+                    // 5. Space Noise Reduction Slider
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Noise Reduc:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(76.dp))
+                        Slider(
+                            value = noiseReductionPower,
+                            onValueChange = onNoiseReductionPowerChange,
+                            valueRange = 0f..100f,
+                            modifier = Modifier.weight(1f).height(24.dp)
+                        )
+                        Text("${noiseReductionPower.toInt()}%", color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.width(32.dp), textAlign = TextAlign.End)
+                    }
+
+                    // 6. Detail Sharpness Slider
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Detail Boost:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(76.dp))
+                        Slider(
+                            value = detailEnhancementPower,
+                            onValueChange = onDetailEnhancementPowerChange,
+                            valueRange = 0f..100f,
+                            modifier = Modifier.weight(1f).height(24.dp)
+                        )
+                        Text("${detailEnhancementPower.toInt()}%", color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.width(32.dp), textAlign = TextAlign.End)
                     }
                 }
             }
@@ -1138,12 +1540,26 @@ fun CaptureScreen(
                 }
             }
 
-            IconButton(
-                onClick = onToggleManualSwipe,
-                modifier = Modifier
-                    .background(if (isManualSwipeMode) Color(0xFF4285F4) else Color.Black.copy(alpha = 0.6f), CircleShape)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(Icons.Default.Swipe, contentDescription = "Manual Swipe Emulator", tint = Color.White)
+                IconButton(
+                    onClick = onToggleManualSwipe,
+                    modifier = Modifier
+                        .background(if (isManualSwipeMode) Color(0xFF4285F4) else Color.Black.copy(alpha = 0.6f), CircleShape)
+                ) {
+                    Icon(Icons.Default.Swipe, contentDescription = "Manual Swipe Emulator", tint = Color.White)
+                }
+
+                IconButton(
+                    onClick = { isSettingsOverlayOpen = !isSettingsOverlayOpen },
+                    modifier = Modifier
+                        .background(if (isSettingsOverlayOpen) Color(0xFF4285F4) else Color.Black.copy(alpha = 0.6f), CircleShape)
+                        .testTag("viewfinder_settings_toggle")
+                ) {
+                    Icon(Icons.Default.Settings, contentDescription = "System Preferences", tint = Color.White)
+                }
             }
         }
 
@@ -1218,7 +1634,7 @@ fun CaptureScreen(
                         while (diffYaw < -180f) diffYaw += 360f
 
                         val diffPitch = node.targetPitch - currentPitch
-                        abs(diffYaw) < 1.4f && abs(diffPitch) < 1.4f
+                        abs(diffYaw) < 1.8f && abs(diffPitch) < 1.8f
                     }
 
                     // Auto Capture trigger detector effect
@@ -1571,10 +1987,14 @@ fun Viewer360Screen(
     highlights: Float,
     shadows: Float,
     tempOffset: Float,
+    toneCurvePreset: String,
+    localContrast: Float,
+    detailBoost: Float,
+    vignette: Float,
     activeMode: String, // "360 Sphere", "Little Planet", "Flat Map"
     isDeveloping: Boolean,
     onModeChange: (String) -> Unit,
-    onParamsChange: (Float, Float, Float, Float) -> Unit,
+    onParamsChange: (Float, Float, Float, Float, String, Float, Float, Float) -> Unit,
     onReprocess: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -1890,7 +2310,7 @@ fun Viewer360Screen(
                         Text("Exposure: ", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(60.dp))
                         Slider(
                             value = exposure,
-                            onValueChange = { onParamsChange(it, highlights, shadows, tempOffset) },
+                            onValueChange = { onParamsChange(it, highlights, shadows, tempOffset, toneCurvePreset, localContrast, detailBoost, vignette) },
                             valueRange = -3.0f..3.0f,
                             modifier = Modifier
                                 .weight(1f)
@@ -1905,7 +2325,7 @@ fun Viewer360Screen(
                         Text("Highlights: ", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(60.dp))
                         Slider(
                             value = highlights,
-                            onValueChange = { onParamsChange(exposure, it, shadows, tempOffset) },
+                            onValueChange = { onParamsChange(exposure, it, shadows, tempOffset, toneCurvePreset, localContrast, detailBoost, vignette) },
                             valueRange = -100f..100f,
                             modifier = Modifier
                                 .weight(1f)
@@ -1919,7 +2339,7 @@ fun Viewer360Screen(
                         Text("Shadows: ", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(60.dp))
                         Slider(
                             value = shadows,
-                            onValueChange = { onParamsChange(exposure, highlights, it, tempOffset) },
+                            onValueChange = { onParamsChange(exposure, highlights, it, tempOffset, toneCurvePreset, localContrast, detailBoost, vignette) },
                             valueRange = -100f..100f,
                             modifier = Modifier
                                 .weight(1f)
@@ -1933,13 +2353,87 @@ fun Viewer360Screen(
                         Text("Temp Offset:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(62.dp))
                         Slider(
                             value = tempOffset,
-                            onValueChange = { onParamsChange(exposure, highlights, shadows, it) },
+                            onValueChange = { onParamsChange(exposure, highlights, shadows, it, toneCurvePreset, localContrast, detailBoost, vignette) },
                             valueRange = -1.0f..1.0f,
                             modifier = Modifier
                                 .weight(1f)
                                 .height(24.dp)
                         )
                         Text("${(tempOffset * 3000).toInt() + 5500} K", color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.width(42.dp), textAlign = TextAlign.End)
+                    }
+
+                    // Tone Curve Preset selection row buttons
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Tone Curve:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(62.dp))
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            listOf("Cinematic", "Contrast", "Astro", "Flat").forEach { curve ->
+                                val isSel = when (curve) {
+                                    "Cinematic" -> toneCurvePreset.contains("Cinematic")
+                                    "Contrast" -> toneCurvePreset.contains("Contrast")
+                                    "Astro" -> toneCurvePreset.contains("Astro")
+                                    else -> !toneCurvePreset.contains("Cinematic") && !toneCurvePreset.contains("Contrast") && !toneCurvePreset.contains("Astro")
+                                }
+                                val label = when(curve) {
+                                    "Cinematic" -> "Cinematic (GCam Modern)"
+                                    "Contrast" -> "HDR+ Deep Contrast"
+                                    "Astro" -> "Astro Sight Glow"
+                                    else -> "Balanced Flat Map"
+                                }
+                                Button(
+                                    onClick = { onParamsChange(exposure, highlights, shadows, tempOffset, label, localContrast, detailBoost, vignette) },
+                                    colors = ButtonDefaults.buttonColors(
+                                        containerColor = if (isSel) Color(0xFFFFB74D) else Color(0xFF262930),
+                                        contentColor = if (isSel) Color.Black else Color.White
+                                    ),
+                                    shape = RoundedCornerShape(6.dp),
+                                    contentPadding = PaddingValues(horizontal = 4.dp, vertical = 2.dp),
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(24.dp)
+                                ) {
+                                    Text(curve, fontSize = 8.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+
+                    // Local Contrast Slider
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Contrast:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(62.dp))
+                        Slider(
+                            value = localContrast,
+                            onValueChange = { onParamsChange(exposure, highlights, shadows, tempOffset, toneCurvePreset, it, detailBoost, vignette) },
+                            valueRange = 0f..100f,
+                            modifier = Modifier.weight(1f).height(24.dp)
+                        )
+                        Text("${localContrast.toInt()}%", color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.width(42.dp), textAlign = TextAlign.End)
+                    }
+
+                    // Detail Sharpening Slider
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Sharpening:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(62.dp))
+                        Slider(
+                            value = detailBoost,
+                            onValueChange = { onParamsChange(exposure, highlights, shadows, tempOffset, toneCurvePreset, localContrast, it, vignette) },
+                            valueRange = 0f..100f,
+                            modifier = Modifier.weight(1f).height(24.dp)
+                        )
+                        Text("${detailBoost.toInt()}%", color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.width(42.dp), textAlign = TextAlign.End)
+                    }
+
+                    // Radial Vignette Slider
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Vignette:", color = Color.White, fontSize = 10.sp, modifier = Modifier.width(62.dp))
+                        Slider(
+                            value = vignette,
+                            onValueChange = { onParamsChange(exposure, highlights, shadows, tempOffset, toneCurvePreset, localContrast, detailBoost, it) },
+                            valueRange = 0f..100f,
+                            modifier = Modifier.weight(1f).height(24.dp)
+                        )
+                        Text("${vignette.toInt()}%", color = Color.LightGray, fontSize = 10.sp, modifier = Modifier.width(42.dp), textAlign = TextAlign.End)
                     }
                 }
             }
